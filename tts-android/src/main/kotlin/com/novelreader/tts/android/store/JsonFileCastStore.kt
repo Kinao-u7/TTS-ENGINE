@@ -19,7 +19,8 @@ import java.io.File
  *
  * Saves are performed atomically via temp file write followed by rename.
  * Corrupt or empty files safely fall back to default characters ("narrator" and "unnamed")
- * without crashing.
+ * without crashing. Supports per-book ignored names list to prevent deleted auto-detected
+ * characters from reappearing on reload.
  */
 class JsonFileCastStore(
     private val baseDir: File,
@@ -37,7 +38,8 @@ class JsonFileCastStore(
 
     private data class BookData(
         val characters: MutableMap<String, Character>,
-        val overrides: MutableMap<String, MutableMap<String, String>> // chapterId -> (segId -> charId)
+        val overrides: MutableMap<String, MutableMap<String, String>>, // chapterId -> (segId -> charId)
+        val ignoredNames: MutableSet<String> = mutableSetOf()
     )
 
     init {
@@ -91,7 +93,8 @@ class JsonFileCastStore(
         chars[Character.UNNAMED_ID] = Character.Unnamed
         return BookData(
             characters = chars,
-            overrides = mutableMapOf()
+            overrides = mutableMapOf(),
+            ignoredNames = mutableSetOf()
         )
     }
 
@@ -122,6 +125,10 @@ class JsonFileCastStore(
             bookData.characters[character.id] = character
             ensureBuiltInsExist(bookData.characters)
 
+            // Re-adding or updating a character unignores its name and aliases
+            bookData.ignoredNames.remove(character.name.trim().lowercase())
+            character.aliases.forEach { bookData.ignoredNames.remove(it.trim().lowercase()) }
+
             saveBookDataToDisk(bookId, bookData)
 
             val flow = getOrCreateFlowLocked(bookId)
@@ -137,6 +144,12 @@ class JsonFileCastStore(
 
         mutex.withLock {
             val bookData = loadOrCreateBookData(bookId)
+            val charToDelete = bookData.characters[characterId] ?: return@withLock
+
+            // Add deleted character name and its aliases to ignoredNames so it won't be recreated on reload
+            bookData.ignoredNames.add(charToDelete.name.trim().lowercase())
+            charToDelete.aliases.forEach { bookData.ignoredNames.add(it.trim().lowercase()) }
+
             bookData.characters.remove(characterId)
             ensureBuiltInsExist(bookData.characters)
 
@@ -183,6 +196,21 @@ class JsonFileCastStore(
         }
     }
 
+    override suspend fun ignoredNames(bookId: String): Set<String> = withContext(ioDispatcher) {
+        mutex.withLock {
+            val bookData = loadOrCreateBookData(bookId)
+            bookData.ignoredNames.toSet()
+        }
+    }
+
+    override suspend fun unignoreName(bookId: String, name: String): Unit = withContext(ioDispatcher) {
+        mutex.withLock {
+            val bookData = loadOrCreateBookData(bookId)
+            bookData.ignoredNames.remove(name.trim().lowercase())
+            saveBookDataToDisk(bookId, bookData)
+        }
+    }
+
     private fun saveBookDataToDisk(bookId: String, data: BookData) {
         if (!baseDir.exists()) {
             baseDir.mkdirs()
@@ -197,7 +225,6 @@ class JsonFileCastStore(
         // Atomic file replacement via rename
         val renamed = tempFile.renameTo(targetFile)
         if (!renamed) {
-            // Fallback for file systems where atomic rename requires destination removal or copy
             if (targetFile.exists()) {
                 targetFile.delete()
             }
@@ -252,7 +279,10 @@ class JsonFileCastStore(
             sb.append("\n")
         }
 
-        sb.append("  }\n")
+        sb.append("  },\n")
+        sb.append("  \"ignoredNames\": [")
+        sb.append(data.ignoredNames.joinToString(", ") { escapeJsonString(it) })
+        sb.append("]\n")
         sb.append("}\n")
         return sb.toString()
     }
@@ -332,8 +362,18 @@ class JsonFileCastStore(
             }
         }
 
+        val ignoredSet = mutableSetOf<String>()
+        val rawIgnored = parsed["ignoredNames"] as? List<*>
+        if (rawIgnored != null) {
+            for (item in rawIgnored) {
+                if (item is String && item.isNotBlank()) {
+                    ignoredSet.add(item.trim().lowercase())
+                }
+            }
+        }
+
         ensureBuiltInsExist(charactersMap)
-        return BookData(characters = charactersMap, overrides = overridesMap)
+        return BookData(characters = charactersMap, overrides = overridesMap, ignoredNames = ignoredSet)
     }
 
     /**

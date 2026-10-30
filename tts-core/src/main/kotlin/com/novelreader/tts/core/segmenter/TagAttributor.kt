@@ -26,22 +26,22 @@ class TagAttributor(
     private val speechVerbs: Set<String> = verbs.map { it.lowercase() }.toSet()
     private val verbsPattern: String = speechVerbs.joinToString("|") { Regex.escape(it) }
 
-    // Pattern 1a: after quote - `," said Lin` or `," whispered Master Xian`
+    // Pattern 1a: after quote - `," said Lin`, `," asked Xian`, `," whispered Chen Yu`, `," called back Xian`
     private val postSaidNameRegex = Regex(
-        """^\s*[,—–-]?\s*(?:$verbsPattern)\s+(?:to\s+[A-Za-z0-9_']+\s+)?([A-Z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*)*)""",
+        """^\s*[,—–-]?\s*(?:$verbsPattern)(?:\s+[a-z]+)?\s+(?:to\s+[A-Za-z0-9_']+(?:\s+[A-Za-z0-9_']+)*\s+)?([A-Z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*){0,2})(?:\s+to\s+[A-Za-z0-9_']+(?:\s+[A-Za-z0-9_']+)*)?\b""",
         RegexOption.IGNORE_CASE
     )
 
-    // Pattern 1b: after quote - `," Lin said` or `," he said`
+    // Pattern 1b: after quote - `," Lin Mo said`, `," Xian called back`, `," he said`
     private val postNameSaidRegex = Regex(
-        """^\s*[,—–-]?\s*([A-Za-z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*)*)\s+(?:$verbsPattern)\b""",
+        """^\s*[,—–-]?\s*([A-Za-z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*){0,2})\s+(?:$verbsPattern)(?:\s+[a-z]+)?(?:\s+to\s+[A-Za-z0-9_']+(?:\s+[A-Za-z0-9_']+)*)?\b""",
         RegexOption.IGNORE_CASE
     )
 
-    // Pattern 2: before quote - `Lin said, "..."` or `He said to Xian:\n"..."`
+    // Pattern 2: before quote - `Lin Mo said, "..."` or `Xian called back: "..."` or `He said to Xian:\n"..."`
     // Extracts subject before the speech verb. Note: recipient in `said to <Recipient>` is NOT the speaker!
     private val preQuoteRegex = Regex(
-        """([A-Za-z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*)*)\s+(?:$verbsPattern)(?:\s+to\s+[A-Za-z0-9_']+)?\s*[,:]?\s*$""",
+        """([A-Za-z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*){0,2})\s+(?:$verbsPattern)(?:\s+[a-z]+)?(?:\s+to\s+[A-Za-z0-9_']+(?:\s+[A-Za-z0-9_']+)*)?\s*[,:]?\s*$""",
         RegexOption.IGNORE_CASE
     )
 
@@ -54,7 +54,8 @@ class TagAttributor(
      */
     fun attribute(
         segments: List<Segment>,
-        existingCharacters: List<Character> = emptyList()
+        existingCharacters: List<Character> = emptyList(),
+        ignoredNames: Set<String> = emptySet()
     ): AttributionResult {
         val characterList = existingCharacters.toMutableList()
         if (characterList.none { it.id == Character.NARRATOR_ID }) {
@@ -64,12 +65,14 @@ class TagAttributor(
             characterList.add(Character.Unnamed)
         }
 
+        val normalizedIgnored = ignoredNames.map { it.trim().lowercase() }.toSet()
+
         val resultSegments = segments.mapIndexed { index, segment ->
             if (segment.type != SegmentType.DIALOGUE) {
                 segment
             } else {
                 val candidateName = findSpeakerCandidate(segments, index)
-                if (candidateName != null && !isPronoun(candidateName)) {
+                if (candidateName != null && !isPronoun(candidateName) && !normalizedIgnored.contains(candidateName.trim().lowercase())) {
                     val resolvedChar = resolveOrCreate(candidateName, characterList)
                     // Set speakerId while leaving speakerOverride untouched
                     segment.copy(speakerId = resolvedChar.id)

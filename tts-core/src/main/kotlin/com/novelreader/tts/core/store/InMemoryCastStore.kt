@@ -16,6 +16,7 @@ class InMemoryCastStore : CastStore {
     private val charactersFlows = mutableMapOf<String, MutableStateFlow<List<Character>>>()
     private val charactersData = mutableMapOf<String, MutableMap<String, Character>>()
     private val overridesData = mutableMapOf<String, MutableMap<String, MutableMap<String, String>>>()
+    private val ignoredNamesData = mutableMapOf<String, MutableSet<String>>()
 
     private fun getOrCreateFlowLocked(bookId: String): MutableStateFlow<List<Character>> {
         return charactersFlows.getOrPut(bookId) {
@@ -46,6 +47,11 @@ class InMemoryCastStore : CastStore {
         bookChars[character.id] = character
         ensureBuiltInsExist(bookChars)
 
+        // Saving a character unignores its name and aliases
+        val ignored = ignoredNamesData.getOrPut(bookId) { mutableSetOf() }
+        ignored.remove(character.name.trim().lowercase())
+        character.aliases.forEach { ignored.remove(it.trim().lowercase()) }
+
         val flow = getOrCreateFlowLocked(bookId)
         flow.value = bookChars.values.toList()
     }
@@ -57,6 +63,13 @@ class InMemoryCastStore : CastStore {
         }
 
         val bookChars = charactersData.getOrPut(bookId) { createDefaultCharacters() }
+        val charToDelete = bookChars[characterId] ?: return@withLock
+
+        // Add deleted character's name and aliases to the ignored list
+        val ignored = ignoredNamesData.getOrPut(bookId) { mutableSetOf() }
+        ignored.add(charToDelete.name.trim().lowercase())
+        charToDelete.aliases.forEach { ignored.add(it.trim().lowercase()) }
+
         bookChars.remove(characterId)
         ensureBuiltInsExist(bookChars)
 
@@ -91,6 +104,15 @@ class InMemoryCastStore : CastStore {
 
     override suspend fun overrides(bookId: String, chapterId: String): Map<String, String> = mutex.withLock {
         overridesData[bookId]?.get(chapterId)?.toMap() ?: emptyMap()
+    }
+
+    override suspend fun ignoredNames(bookId: String): Set<String> = mutex.withLock {
+        ignoredNamesData[bookId]?.toSet() ?: emptySet()
+    }
+
+    override suspend fun unignoreName(bookId: String, name: String) = mutex.withLock {
+        ignoredNamesData[bookId]?.remove(name.trim().lowercase())
+        Unit
     }
 
     private fun ensureBuiltInsExist(map: MutableMap<String, Character>) {

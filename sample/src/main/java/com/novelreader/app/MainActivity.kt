@@ -1,5 +1,6 @@
 package com.novelreader.app
 
+import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -72,6 +73,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -81,6 +83,7 @@ import com.novelreader.tts.android.engine.SystemTtsEngine
 import com.novelreader.tts.android.store.JsonFileCastStore
 import com.novelreader.tts.core.engine.SpeechEvent
 import com.novelreader.tts.core.model.Character
+import com.novelreader.tts.core.model.CharacterResolver
 import com.novelreader.tts.core.model.Segment
 import com.novelreader.tts.core.model.SegmentType
 import com.novelreader.tts.core.model.VoiceGender
@@ -155,17 +158,12 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private const val DEFAULT_SAMPLE_TEXT = """The dogs' bones were buried near Xian's sword. 'tis a dark night.
-"Run," said Lin.
-Lin said, "Run."
-"Run," he said.
-He said to Xian:
-"We leave at dawn."
-"Prepare the carriage," replied Master Xian calmly.
-The horses stamped their hooves in the cold mist."""
+private const val STABLE_BOOK_ID = "test_book"
 
-private const val CURRENT_BOOK_ID = "sample_novel"
-private const val CURRENT_CHAPTER_ID = "chapter_1"
+fun deriveChapterId(text: String): String {
+    val hash = NovelSegmenter.computeShortHash(text)
+    return "ch_$hash"
+}
 
 fun formatReadableLocale(localeTag: String): String {
     return try {
@@ -187,12 +185,20 @@ fun MainAppScaffold(
     debugTracker: TtsDebugTracker,
     onPlayClicked: () -> Unit
 ) {
-    var selectedTab by remember { mutableIntStateOf(0) }
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("novel_reader_prefs", Context.MODE_PRIVATE) }
     val scope = rememberCoroutineScope()
 
-    val charactersList by castStore.characters(CURRENT_BOOK_ID).collectAsState(initial = emptyList())
+    var selectedTab by remember { mutableIntStateOf(0) }
+    var autoDetectSpeakers by remember { mutableStateOf(prefs.getBoolean("auto_detect_speakers", true)) }
+
+    val charactersList by castStore.characters(STABLE_BOOK_ID).collectAsState(initial = emptyList())
     var availableVoices by remember { mutableStateOf<List<VoiceInfo>>(emptyList()) }
-    var chapterInputText by remember { mutableStateOf(DEFAULT_SAMPLE_TEXT) }
+
+    // Remember the last pasted text across restarts (empty string on fresh launch)
+    var chapterInputText by remember {
+        mutableStateOf(prefs.getString("last_pasted_text", "") ?: "")
+    }
     var segments by remember { mutableStateOf<List<Segment>>(emptyList()) }
 
     val readerState by controller.readerState.collectAsState()
@@ -213,9 +219,27 @@ fun MainAppScaffold(
         }
     }
 
-    // Function to load and segment chapter, applying overrides and tag attribution
+    // Function to load and segment chapter, stopping playback, clearing old segments,
+    // running TagAttributor (setting speakerId only), auto-creating characters with distinct voices,
+    // and applying stored overrides based on the text hash chapterId.
     fun processAndLoadChapter(textToLoad: String) {
         scope.launch {
+            // Stop playback and clear previous segments completely
+            controller.stop()
+            segments = emptyList()
+            controller.loadSegments(emptyList())
+
+            if (textToLoad.isBlank()) {
+                prefs.edit().putString("last_pasted_text", "").apply()
+                return@launch
+            }
+
+            // Persist the pasted text
+            prefs.edit().putString("last_pasted_text", textToLoad).apply()
+
+            // Derive chapterId from hash of the loaded text so overrides never collide
+            val chapterId = deriveChapterId(textToLoad)
+
             val rawSegments = NovelSegmenter.segment(textToLoad)
             val currentChars = if (charactersList.isEmpty()) {
                 listOf(Character.Narrator, Character.Unnamed)
@@ -223,20 +247,38 @@ fun MainAppScaffold(
                 charactersList
             }
 
-            val attribution = TagAttributor().attribute(rawSegments, currentChars)
+            val attributedSegments = if (autoDetectSpeakers) {
+                val ignoredNames = castStore.ignoredNames(STABLE_BOOK_ID)
+                val attribution = TagAttributor().attribute(rawSegments, currentChars, ignoredNames)
 
-            // Auto-save any newly discovered characters into CastStore
-            for (newChar in attribution.characters) {
-                if (currentChars.none { it.id == newChar.id }) {
-                    castStore.saveCharacter(CURRENT_BOOK_ID, newChar)
+                // For any newly created character from TagAttributor, pick a distinct voice once and save it
+                val usedVoiceIds = currentChars.mapNotNull { it.voiceId }.toMutableSet()
+                val narratorVoiceId = currentChars.firstOrNull { it.id == Character.NARRATOR_ID }?.voiceId
+
+                for (newChar in attribution.characters) {
+                    if (currentChars.none { it.id == newChar.id }) {
+                        val voiceResult = VoiceSelector.pick(
+                            character = newChar,
+                            availableVoices = availableVoices,
+                            usedVoices = usedVoiceIds,
+                            bookLocale = "en-US",
+                            narratorVoiceId = narratorVoiceId
+                        )
+                        val charWithVoice = newChar.copy(voiceId = voiceResult.voice?.id)
+                        voiceResult.voice?.id?.let { usedVoiceIds.add(it) }
+                        castStore.saveCharacter(STABLE_BOOK_ID, charWithVoice)
+                    }
                 }
+                attribution.segments
+            } else {
+                rawSegments
             }
 
-            // Load stored overrides for this book & chapter
-            val overridesMap = castStore.overrides(CURRENT_BOOK_ID, CURRENT_CHAPTER_ID)
+            // Load stored overrides for this book & chapterId
+            val overridesMap = castStore.overrides(STABLE_BOOK_ID, chapterId)
 
             // Apply overrides as speakerOverride (ignoring non-existent segment IDs silently)
-            val segmentsWithOverrides = attribution.segments.map { seg ->
+            val finalSegments = attributedSegments.map { seg ->
                 val overrideId = overridesMap[seg.id]
                 if (overrideId != null) {
                     seg.copy(speakerOverride = overrideId)
@@ -245,14 +287,16 @@ fun MainAppScaffold(
                 }
             }
 
-            segments = segmentsWithOverrides
-            controller.loadSegments(segmentsWithOverrides)
+            segments = finalSegments
+            controller.loadSegments(finalSegments)
         }
     }
 
-    // Initial load
+    // Initial load: if user had previously pasted text, restore it
     LaunchedEffect(Unit) {
-        processAndLoadChapter(chapterInputText)
+        if (chapterInputText.isNotBlank()) {
+            processAndLoadChapter(chapterInputText)
+        }
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -275,7 +319,6 @@ fun MainAppScaffold(
         Box(modifier = Modifier.weight(1f)) {
             if (selectedTab == 0) {
                 ReaderTabContent(
-                    ttsEngine = ttsEngine,
                     controller = controller,
                     castStore = castStore,
                     debugTracker = debugTracker,
@@ -296,7 +339,15 @@ fun MainAppScaffold(
                     castStore = castStore,
                     charactersList = charactersList,
                     availableVoices = availableVoices,
-                    segments = segments
+                    segments = segments,
+                    autoDetectSpeakers = autoDetectSpeakers,
+                    onAutoDetectSpeakersChange = { enabled ->
+                        autoDetectSpeakers = enabled
+                        prefs.edit().putBoolean("auto_detect_speakers", enabled).apply()
+                        if (chapterInputText.isNotBlank()) {
+                            processAndLoadChapter(chapterInputText)
+                        }
+                    }
                 )
             }
         }
@@ -306,7 +357,6 @@ fun MainAppScaffold(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ReaderTabContent(
-    ttsEngine: SystemTtsEngine,
     controller: PlaybackController,
     castStore: CastStore,
     debugTracker: TtsDebugTracker,
@@ -325,6 +375,10 @@ fun ReaderTabContent(
     val scope = rememberCoroutineScope()
 
     var segmentForSpeakerSheet by remember { mutableStateOf<Segment?>(null) }
+
+    val dialogueSegments = segments.filter { it.type == SegmentType.DIALOGUE }
+    val autoAssignedCount = dialogueSegments.count { it.speakerId != null }
+    val unnamedCount = dialogueSegments.count { it.speakerId == null }
 
     Column(
         modifier = Modifier
@@ -415,7 +469,7 @@ fun ReaderTabContent(
             Spacer(modifier = Modifier.height(8.dp))
         }
 
-        // Debug Panel
+        // Debug Panel & Dialogue Attribution Stats
         OutlinedCard(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.outlinedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
@@ -443,6 +497,14 @@ fun ReaderTabContent(
                         maxLines = 1
                     )
                 }
+                Spacer(modifier = Modifier.height(4.dp))
+                // Debug line showing how many dialogue lines were auto-assigned vs Unnamed
+                Text(
+                    text = "Dialogue: $autoAssignedCount auto-assigned, $unnamedCount Unnamed (${dialogueSegments.size} total)",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.secondary
+                )
             }
         }
 
@@ -456,13 +518,14 @@ fun ReaderTabContent(
                 .fillMaxWidth()
                 .height(100.dp),
             label = { Text("Paste Chapter Text") },
+            placeholder = { Text("Paste novel chapter text here...") },
             textStyle = MaterialTheme.typography.bodySmall,
             maxLines = 4
         )
 
         Spacer(modifier = Modifier.height(6.dp))
 
-        // Action Buttons Row
+        // Action Buttons Row (Only "Load" and "Cast", no sample button)
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -471,17 +534,7 @@ fun ReaderTabContent(
                 onClick = { onLoadChapter(chapterInputText) },
                 modifier = Modifier.weight(1f)
             ) {
-                Text("Load & Segment")
-            }
-
-            OutlinedButton(
-                onClick = {
-                    onChapterInputTextChange(DEFAULT_SAMPLE_TEXT)
-                    onLoadChapter(DEFAULT_SAMPLE_TEXT)
-                },
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("Use Sample")
+                Text("Load")
             }
 
             FilledTonalButton(onClick = onOpenCastScreen) {
@@ -503,85 +556,100 @@ fun ReaderTabContent(
 
         Spacer(modifier = Modifier.height(4.dp))
 
-        LazyColumn(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-        ) {
-            itemsIndexed(segments) { _, segment ->
-                val isHighlighted = readerState.sentenceHighlight?.let { hl ->
-                    segment.startOffset <= hl.startOffset && segment.endOffset >= hl.endOffset
-                } ?: false
+        if (segments.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "No segments loaded. Paste text above and tap Load.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.secondary
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+            ) {
+                itemsIndexed(segments) { _, segment ->
+                    val isHighlighted = readerState.sentenceHighlight?.let { hl ->
+                        segment.startOffset <= hl.startOffset && segment.endOffset >= hl.endOffset
+                    } ?: false
 
-                val speakerChar = charactersList.firstOrNull { it.id == segment.effectiveSpeakerId }
-                val effectiveDisplayName = speakerChar?.name ?: when (segment.effectiveSpeakerId) {
-                    Character.NARRATOR_ID -> "Narrator"
-                    Character.UNNAMED_ID -> "Unnamed"
-                    else -> segment.effectiveSpeakerId
-                }
+                    val speakerChar = charactersList.firstOrNull { it.id == segment.effectiveSpeakerId }
+                    val effectiveDisplayName = speakerChar?.name ?: when (segment.effectiveSpeakerId) {
+                        Character.NARRATOR_ID -> "Narrator"
+                        Character.UNNAMED_ID -> "Unnamed"
+                        else -> segment.effectiveSpeakerId
+                    }
 
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 3.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .then(
-                            if (segment.type == SegmentType.DIALOGUE) {
-                                Modifier.clickable { segmentForSpeakerSheet = segment }
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 3.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .then(
+                                if (segment.type == SegmentType.DIALOGUE) {
+                                    Modifier.clickable { segmentForSpeakerSheet = segment }
+                                } else {
+                                    Modifier
+                                }
+                            ),
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (isHighlighted) {
+                                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f)
+                            } else if (segment.type == SegmentType.DIALOGUE) {
+                                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
                             } else {
-                                Modifier
+                                MaterialTheme.colorScheme.surface
                             }
-                        ),
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (isHighlighted) {
-                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f)
-                        } else if (segment.type == SegmentType.DIALOGUE) {
-                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-                        } else {
-                            MaterialTheme.colorScheme.surface
-                        }
-                    )
-                ) {
-                    Column(modifier = Modifier.padding(8.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "${segment.type} [${segment.id}]",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.secondary
-                            )
+                        )
+                    ) {
+                        Column(modifier = Modifier.padding(8.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "${segment.type} [${segment.id}]",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.secondary
+                                )
 
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = "Reader: ",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                Text(
-                                    text = effectiveDisplayName,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontWeight = FontWeight.Bold,
-                                    color = if (segment.speakerOverride != null) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary
-                                )
-                                if (segment.speakerOverride != null) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
                                     Text(
-                                        text = " (override)",
+                                        text = "Reader: ",
                                         style = MaterialTheme.typography.labelSmall,
-                                        fontSize = 10.sp,
-                                        color = MaterialTheme.colorScheme.tertiary
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
+                                    Text(
+                                        text = effectiveDisplayName,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (segment.speakerOverride != null) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary
+                                    )
+                                    if (segment.speakerOverride != null) {
+                                        Text(
+                                            text = " (override)",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontSize = 10.sp,
+                                            color = MaterialTheme.colorScheme.tertiary
+                                        )
+                                    }
                                 }
                             }
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = segment.text,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontSize = 14.sp
+                            )
                         }
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Text(
-                            text = segment.text,
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontSize = 14.sp
-                        )
                     }
                 }
             }
@@ -630,6 +698,7 @@ fun ReaderTabContent(
     if (segmentForSpeakerSheet != null) {
         val targetSegment = segmentForSpeakerSheet!!
         val sheetState = rememberModalBottomSheetState()
+        val chapterId = deriveChapterId(chapterInputText)
 
         ModalBottomSheet(
             onDismissRequest = { segmentForSpeakerSheet = null },
@@ -663,7 +732,7 @@ fun ReaderTabContent(
                                 .padding(vertical = 4.dp)
                                 .clickable {
                                     scope.launch {
-                                        castStore.setOverride(CURRENT_BOOK_ID, CURRENT_CHAPTER_ID, targetSegment.id, char.id)
+                                        castStore.setOverride(STABLE_BOOK_ID, chapterId, targetSegment.id, char.id)
                                     }
                                     controller.reassignSpeaker(targetSegment.id, char.id, isOverride = true)
                                     val updated = segments.map {
@@ -726,7 +795,9 @@ fun CastTabContent(
     castStore: CastStore,
     charactersList: List<Character>,
     availableVoices: List<VoiceInfo>,
-    segments: List<Segment>
+    segments: List<Segment>,
+    autoDetectSpeakers: Boolean,
+    onAutoDetectSpeakersChange: (Boolean) -> Unit
 ) {
     val scope = rememberCoroutineScope()
     var characterToEdit by remember { mutableStateOf<Character?>(null) }
@@ -760,6 +831,39 @@ fun CastTabContent(
                 Icon(Icons.Default.Add, contentDescription = "Add", modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(4.dp))
                 Text("Add Character")
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // Auto-detect speakers toggle card
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Auto-detect speakers",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "Infer speaker from dialogue tags (e.g. said Xian)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.secondary
+                    )
+                }
+                Switch(
+                    checked = autoDetectSpeakers,
+                    onCheckedChange = onAutoDetectSpeakersChange
+                )
             }
         }
 
@@ -869,13 +973,13 @@ fun CastTabContent(
         val char = characterToEdit!!
         val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
-        var editedName by remember { mutableStateOf(char.name) }
-        var selectedVoiceId by remember { mutableStateOf(char.voiceId) }
-        var selectedGender by remember { mutableStateOf(char.voiceGender) }
-        var editedSpeed by remember { mutableFloatStateOf(char.speed) }
-        var editedPitch by remember { mutableFloatStateOf(char.pitch) }
-        var readByNarrator by remember { mutableStateOf(char.readByNarrator) }
-        var showVoiceDropdown by remember { mutableStateOf(false) }
+        var editedName by remember(char.id) { mutableStateOf(char.name) }
+        var selectedVoiceId by remember(char.id) { mutableStateOf(char.voiceId) }
+        var selectedGender by remember(char.id) { mutableStateOf(char.voiceGender) }
+        var editedSpeed by remember(char.id) { mutableFloatStateOf(char.speed) }
+        var editedPitch by remember(char.id) { mutableFloatStateOf(char.pitch) }
+        var readByNarrator by remember(char.id) { mutableStateOf(char.readByNarrator) }
+        var showVoiceDropdown by remember(char.id) { mutableStateOf(false) }
 
         ModalBottomSheet(
             onDismissRequest = { characterToEdit = null },
@@ -1053,7 +1157,10 @@ fun CastTabContent(
                         OutlinedButton(
                             onClick = {
                                 scope.launch {
-                                    castStore.deleteCharacter(CURRENT_BOOK_ID, char.id)
+                                    castStore.deleteCharacter(STABLE_BOOK_ID, char.id)
+                                    if (chapterInputText.isNotBlank()) {
+                                        processAndLoadChapter(chapterInputText)
+                                    }
                                 }
                                 characterToEdit = null
                             },
@@ -1068,8 +1175,15 @@ fun CastTabContent(
 
                     Button(
                         onClick = {
+                            val trimmedNewName = editedName.trim()
+                            val updatedAliases = if (!trimmedNewName.equals(char.name, ignoreCase = true)) {
+                                (char.aliases + char.name).distinctBy { it.lowercase() }
+                            } else {
+                                char.aliases
+                            }
                             val updated = char.copy(
-                                name = editedName.trim(),
+                                name = trimmedNewName,
+                                aliases = updatedAliases,
                                 voiceId = selectedVoiceId,
                                 voiceGender = selectedGender,
                                 speed = editedSpeed,
@@ -1077,9 +1191,11 @@ fun CastTabContent(
                                 readByNarrator = readByNarrator
                             )
                             scope.launch {
-                                castStore.saveCharacter(CURRENT_BOOK_ID, updated)
+                                castStore.saveCharacter(STABLE_BOOK_ID, updated)
+                                if (chapterInputText.isNotBlank()) {
+                                    processAndLoadChapter(chapterInputText)
+                                }
                             }
-                            // Applied from the next sentence without flushing the queue
                             controller.updateCharacters(charactersList.map { if (it.id == updated.id) updated else it })
                             characterToEdit = null
                         },
@@ -1143,7 +1259,10 @@ fun CastTabContent(
                                 readByNarrator = newReadByNarrator
                             )
                             scope.launch {
-                                castStore.saveCharacter(CURRENT_BOOK_ID, newChar)
+                                castStore.saveCharacter(STABLE_BOOK_ID, newChar)
+                                if (chapterInputText.isNotBlank()) {
+                                    processAndLoadChapter(chapterInputText)
+                                }
                             }
                             controller.updateCharacters(charactersList + newChar)
                             showAddDialog = false
@@ -1162,3 +1281,4 @@ fun CastTabContent(
         )
     }
 }
+

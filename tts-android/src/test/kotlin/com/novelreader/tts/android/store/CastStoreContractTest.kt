@@ -279,4 +279,122 @@ class JsonFileCastStoreSpecificTest {
         val overrides = store.overrides("non_existent_book", "ch_1")
         assertTrue(overrides.isEmpty())
     }
+
+    @Test
+    fun `auto-created character can be edited and voice change persists across a new store instance`() = runTest {
+        val dir = tempFolder.newFolder("edit_persist_test")
+        val store1 = JsonFileCastStore(dir)
+        val bookId = "novel_edit"
+
+        // Simulate auto-creation of a character (created through saveCharacter)
+        val autoCreated = Character(
+            id = "char_lin_mo",
+            name = "Lin Mo",
+            voiceId = "en-us-voice-1",
+            speed = 1.0f,
+            pitch = 1.0f
+        )
+        store1.saveCharacter(bookId, autoCreated)
+
+        // Edit character: change voice and speed
+        val edited = autoCreated.copy(voiceId = "en-gb-voice-2", speed = 1.3f)
+        store1.saveCharacter(bookId, edited)
+
+        // Create new store instance pointing to same storage
+        val store2 = JsonFileCastStore(dir)
+        val loadedChars = store2.characters(bookId).first()
+        val loaded = loadedChars.firstOrNull { it.id == "char_lin_mo" }
+
+        assertNotNull(loaded)
+        assertEquals("en-gb-voice-2", loaded?.voiceId)
+        assertEquals(1.3f, loaded?.speed)
+    }
+
+    @Test
+    fun `auto-created character can be deleted - lines revert and name not recreated on reload`() = runTest {
+        val dir = tempFolder.newFolder("delete_revert_test")
+        val store = JsonFileCastStore(dir)
+        val bookId = "novel_delete"
+        val chapterText = "\"Run!\" said Lin Mo.\n\"Hurry!\" muttered Lin Mo."
+
+        // 1. Initial load & segmentation
+        val segments = com.novelreader.tts.core.segmenter.NovelSegmenter.segment(chapterText)
+        val attributor = com.novelreader.tts.core.segmenter.TagAttributor()
+        val attribution = attributor.attribute(segments)
+
+        // Auto-create character Lin Mo in store
+        val detectedLin = attribution.characters.first { it.name == "Lin Mo" }
+        store.saveCharacter(bookId, detectedLin)
+
+        // Verify initial attribution
+        assertEquals(detectedLin.id, attribution.segments[0].speakerId)
+        assertEquals(detectedLin.id, attribution.segments[0].effectiveSpeakerId)
+
+        // 2. Delete character
+        store.deleteCharacter(bookId, detectedLin.id)
+
+        // Verify character is removed from store
+        val currentChars = store.characters(bookId).first()
+        assertFalse(currentChars.any { it.id == detectedLin.id })
+
+        // Verify name is recorded in ignoredNames
+        val ignored = store.ignoredNames(bookId)
+        assertTrue(ignored.contains("lin mo"))
+
+        // 3. Reload chapter text: name must NOT be recreated and lines revert to Unnamed
+        val reloadedSegments = com.novelreader.tts.core.segmenter.NovelSegmenter.segment(chapterText)
+        val reattribution = attributor.attribute(
+            segments = reloadedSegments,
+            existingCharacters = currentChars,
+            ignoredNames = ignored
+        )
+
+        // Deleted name is NOT recreated
+        assertFalse(reattribution.characters.any { it.name == "Lin Mo" })
+
+        // Lines revert to Unnamed
+        assertNull(reattribution.segments[0].speakerId)
+        assertEquals(Character.UNNAMED_ID, reattribution.segments[0].effectiveSpeakerId)
+        assertNull(reattribution.segments[2].speakerId)
+        assertEquals(Character.UNNAMED_ID, reattribution.segments[2].effectiveSpeakerId)
+    }
+
+    @Test
+    fun `auto-created character can be renamed - alias resolves to the same character with no duplicate`() = runTest {
+        val dir = tempFolder.newFolder("rename_alias_test")
+        val store = JsonFileCastStore(dir)
+        val bookId = "novel_rename"
+        val chapterText = "\"Run!\" said Lin Mo."
+
+        // 1. Initial auto-detection
+        val segments1 = com.novelreader.tts.core.segmenter.NovelSegmenter.segment(chapterText)
+        val attributor = com.novelreader.tts.core.segmenter.TagAttributor()
+        val attribution1 = attributor.attribute(segments1)
+        val originalChar = attribution1.characters.first { it.name == "Lin Mo" }
+        store.saveCharacter(bookId, originalChar)
+
+        // 2. Rename character: new name "General Lin", old name "Lin Mo" kept in aliases
+        val renamed = originalChar.copy(
+            name = "General Lin",
+            aliases = (originalChar.aliases + originalChar.name).distinctBy { it.lowercase() }
+        )
+        store.saveCharacter(bookId, renamed)
+
+        // 3. Reload chapter text containing "said Lin Mo": alias must map to renamed character
+        val charsInStore = store.characters(bookId).first()
+        val segments2 = com.novelreader.tts.core.segmenter.NovelSegmenter.segment(chapterText)
+        val attribution2 = attributor.attribute(segments2, charsInStore)
+
+        // Must resolve to same character ID
+        assertEquals(renamed.id, attribution2.segments[0].speakerId)
+        assertEquals(renamed.id, attribution2.segments[0].effectiveSpeakerId)
+
+        // Must NOT create a duplicate Lin Mo character
+        val linMoMatches = attribution2.characters.filter { it.name.equals("Lin Mo", ignoreCase = true) }
+        assertTrue("No duplicate character named Lin Mo should exist", linMoMatches.isEmpty())
+
+        val generalLinMatches = attribution2.characters.filter { it.id == renamed.id }
+        assertEquals(1, generalLinMatches.size)
+        assertEquals("General Lin", generalLinMatches[0].name)
+    }
 }
