@@ -128,8 +128,6 @@ class PlaybackControllerTest {
         assertEquals(1, controller.readerState.value.currentSentenceIndex)
         assertTrue(controller.readerState.value.isPlaying)
 
-        val speakCountBeforePause = fakeEngine.speakRecords.size
-
         // Pause
         controller.pause()
         assertFalse(controller.readerState.value.isPlaying)
@@ -153,12 +151,13 @@ class PlaybackControllerTest {
         controller.play()
 
         val initialStopCount = fakeEngine.stopCount
+        val initialRecordCount = fakeEngine.speakRecords.size
 
         // Currently playing sentence 0 of seg_0 -> reassigning seg_0 must flush and restart
         controller.reassignSpeaker("seg_0", "char_xian")
 
         assertTrue(fakeEngine.stopCount > initialStopCount)
-        val restartedRecord = fakeEngine.speakRecords.last()
+        val restartedRecord = fakeEngine.speakRecords[initialRecordCount]
         assertEquals("\"Line zero.\"", restartedRecord.sentence)
         assertEquals("voice_en_m1", restartedRecord.voice?.id)
     }

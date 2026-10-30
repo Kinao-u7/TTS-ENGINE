@@ -85,7 +85,7 @@ class PlaybackController(
     private var globalSpeed: Float? = null
 
     private var currentSentenceIndex: Int = 0
-    private var lastEnqueuedIndex: Int = -1
+    private var nextToEnqueueIndex: Int = 0
     private var playRequestedWhenReady: Boolean = false
 
     private var eventCollectorJob: Job? = null
@@ -126,7 +126,7 @@ class PlaybackController(
         sentences = splitSegmentsIntoSentences(newSegments)
 
         currentSentenceIndex = initialSentenceIndex.coerceIn(0, (sentences.size - 1).coerceAtLeast(0))
-        lastEnqueuedIndex = currentSentenceIndex - 1
+        nextToEnqueueIndex = currentSentenceIndex
         playRequestedWhenReady = false
 
         updateReaderState(isPlaying = false)
@@ -182,11 +182,11 @@ class PlaybackController(
     private fun startPlayingFromCurrent() {
         if (sentences.isEmpty()) return
 
-        lastEnqueuedIndex = currentSentenceIndex - 1
+        nextToEnqueueIndex = currentSentenceIndex
         updateReaderState(isPlaying = true)
         _state.value = PlaybackState.Playing(getSegmentIndexForSentence(currentSentenceIndex), null)
 
-        refillQueue()
+        fillLookaheadQueue()
     }
 
     /**
@@ -198,7 +198,7 @@ class PlaybackController(
 
         playRequestedWhenReady = false
         speechEngine.stop()
-        lastEnqueuedIndex = currentSentenceIndex - 1
+        nextToEnqueueIndex = currentSentenceIndex
 
         updateReaderState(isPlaying = false, clearWordHighlight = true)
         _state.value = PlaybackState.Paused(getSegmentIndexForSentence(currentSentenceIndex), null)
@@ -228,7 +228,7 @@ class PlaybackController(
     fun stop() {
         playRequestedWhenReady = false
         speechEngine.stop()
-        lastEnqueuedIndex = currentSentenceIndex - 1
+        nextToEnqueueIndex = currentSentenceIndex
 
         updateReaderState(isPlaying = false, clearSentenceHighlight = true, clearWordHighlight = true)
         _state.value = PlaybackState.Stopped
@@ -259,7 +259,7 @@ class PlaybackController(
 
         speechEngine.stop()
         currentSentenceIndex = boundedIndex
-        lastEnqueuedIndex = currentSentenceIndex - 1
+        nextToEnqueueIndex = currentSentenceIndex
 
         if (wasPlaying) {
             startPlayingFromCurrent()
@@ -298,24 +298,34 @@ class PlaybackController(
         val isCurrentlyPlaying = currentlyPlayingSentence?.segmentId == segmentId
 
         if (isCurrentlyPlaying && _readerState.value.isPlaying) {
-            // Flush queue and restart from this sentence with new voice
+            // Stop, drop queued sentences, and restart from this segment
             speechEngine.stop()
-            lastEnqueuedIndex = currentSentenceIndex - 1
-            refillQueue()
+            val segmentStartIndex = sentences.indexOfFirst { it.segmentId == segmentId }
+            if (segmentStartIndex >= 0) {
+                currentSentenceIndex = segmentStartIndex
+            }
+            startPlayingFromCurrent()
         }
     }
 
     /**
-     * Maintains lookahead queue: always keeps at least [lookaheadCount] sentences enqueued ahead.
+     * Fills the lookahead queue: always keeps at least [lookaheadCount] sentences enqueued ahead.
      */
-    private fun refillQueue() {
+    private fun fillLookaheadQueue() {
         if (!_readerState.value.isPlaying || sentences.isEmpty()) return
 
-        val targetMaxIndex = minOf(sentences.size - 1, currentSentenceIndex + lookaheadCount)
-        while (lastEnqueuedIndex < targetMaxIndex) {
-            val nextIndexToEnqueue = lastEnqueuedIndex + 1
-            enqueueSentence(sentences[nextIndexToEnqueue])
-            lastEnqueuedIndex = nextIndexToEnqueue
+        val targetCount = minOf(sentences.size, currentSentenceIndex + 1 + lookaheadCount)
+        while (nextToEnqueueIndex < targetCount) {
+            enqueueSentence(sentences[nextToEnqueueIndex])
+            nextToEnqueueIndex++
+        }
+    }
+
+    private fun refillNext() {
+        if (!_readerState.value.isPlaying || sentences.isEmpty()) return
+        if (nextToEnqueueIndex < sentences.size) {
+            enqueueSentence(sentences[nextToEnqueueIndex])
+            nextToEnqueueIndex++
         }
     }
 
@@ -376,8 +386,8 @@ class PlaybackController(
                     rangeInSegment = sentence?.let { TextRange(it.sentenceStartInSegment, it.sentenceEndInSegment) }
                 )
 
-                // Refill queue on onStart of earlier utterances
-                refillQueue()
+                // Refill queue on onStart of earlier utterances without waiting for completion
+                refillNext()
             }
 
             is SpeechEvent.Range -> {
@@ -409,7 +419,7 @@ class PlaybackController(
                     _state.value = PlaybackState.Stopped
                 } else {
                     // Refill queue on onDone of earlier utterances
-                    refillQueue()
+                    refillNext()
                 }
             }
 
