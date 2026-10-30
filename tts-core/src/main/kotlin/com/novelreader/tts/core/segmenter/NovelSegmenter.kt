@@ -17,7 +17,8 @@ import com.novelreader.tts.core.model.SegmentType
  * - Quotes on their own lines
  * - Narration followed by dialogue on a subsequent line
  * - Multi-paragraph quotes where an opening quote is not closed before a new paragraph begins with a quote
- * - Unclosed quotes (gracefully terminated at the end of the paragraph or input)
+ * - Unclosed opening quotes (gracefully terminated at the end of the paragraph or input)
+ * - Orphan closing quotes with no matching opening quote (marks text from start of paragraph or last sentence terminator as DIALOGUE)
  * - Stable segment IDs: "<dialogueIndexInChapter>-<short hash of segment text>", never raw offsets
  * - Effective speaker defaults to "narrator" for narration and "unnamed" for dialogue.
  */
@@ -137,11 +138,22 @@ object NovelSegmenter {
         val length = text.length
 
         while (i < length) {
-            val openChar = text[i]
+            val ch = text[i]
+
             if (isOpeningQuote(text, i, options)) {
-                val span = extractDialogue(text, i, openChar, options)
+                val span = extractDialogue(text, i, ch, options)
                 spans.add(span)
                 i = span.endOffset
+            } else if (isClosingQuoteOnly(text, i, options)) {
+                // Orphan closing quote with no matching opening quote
+                val prevSpanEnd = spans.lastOrNull()?.endOffset ?: 0
+                val lastParaBreak = findLastParagraphBreakBefore(text, i, prevSpanEnd)
+                val startBound = maxOf(lastParaBreak, prevSpanEnd)
+                val startOffset = findDialogueStartForOrphanClose(text, startBound, i)
+
+                val span = DialogueSpan(startOffset = startOffset, endOffset = i + 1)
+                spans.add(span)
+                i = i + 1
             } else {
                 i++
             }
@@ -153,10 +165,56 @@ object NovelSegmenter {
     private fun isOpeningQuote(text: String, index: Int, options: SegmenterOptions): Boolean {
         val ch = text[index]
         return when (ch) {
-            '"', '“', '«' -> true
+            '“', '«' -> true
+            '"' -> isStraightQuoteOpening(text, index)
             '\'', '‘' -> options.effectiveSingleQuoteDialogue && isSingleQuoteOpening(text, index)
             else -> false
         }
+    }
+
+    private fun isClosingQuoteOnly(text: String, index: Int, options: SegmenterOptions): Boolean {
+        val ch = text[index]
+        return when (ch) {
+            '”', '»' -> true
+            '"' -> isStraightQuoteClosing(text, index) && !isStraightQuoteOpening(text, index)
+            '\'', '’' -> options.effectiveSingleQuoteDialogue && isSingleQuoteClosing(text, index) && !isSingleQuoteOpening(text, index)
+            else -> false
+        }
+    }
+
+    private fun isStraightQuoteOpening(text: String, index: Int): Boolean {
+        val prev = if (index > 0) text[index - 1] else null
+        val next = if (index + 1 < text.length) text[index + 1] else null
+
+        val isPrevStartOrWhitespace = prev == null || prev.isWhitespace() || prev in "([{\n\r—–-«“"
+        val isNextLetterOrDigitOrSymbol = next != null && (next.isLetterOrDigit() || next in "...—–-“«'‘?!”\"")
+
+        return isPrevStartOrWhitespace && isNextLetterOrDigitOrSymbol
+    }
+
+    private fun isStraightQuoteClosing(text: String, index: Int): Boolean {
+        val prev = if (index > 0) text[index - 1] else null
+        val next = if (index + 1 < text.length) text[index + 1] else null
+
+        val isPrevNonWhitespace = prev != null && !prev.isWhitespace()
+        val isNextWhitespaceOrPunctuationOrEnd = next == null || next.isWhitespace() || isPunctuation(next)
+
+        return isPrevNonWhitespace && isNextWhitespaceOrPunctuationOrEnd
+    }
+
+    private fun isSingleQuoteClosing(text: String, index: Int): Boolean {
+        if (isApostrophe(text, index)) return false
+        val prev = if (index > 0) text[index - 1] else null
+        val next = if (index + 1 < text.length) text[index + 1] else null
+
+        val isPrevNonWhitespace = prev != null && !prev.isWhitespace()
+        val isNextWhitespaceOrPunctuationOrEnd = next == null || next.isWhitespace() || isPunctuation(next)
+
+        return isPrevNonWhitespace && isNextWhitespaceOrPunctuationOrEnd
+    }
+
+    private fun isPunctuation(ch: Char): Boolean {
+        return ch in ".,;:!?—–-)}]»”\"'\n\r"
     }
 
     private fun isSingleQuoteOpening(text: String, index: Int): Boolean {
@@ -179,6 +237,50 @@ object NovelSegmenter {
             }
         }
         return false
+    }
+
+    private fun findLastParagraphBreakBefore(text: String, index: Int, minBound: Int): Int {
+        var k = index - 1
+        while (k >= minBound) {
+            if (text[k] == '\n' || text[k] == '\r') {
+                return k + 1
+            }
+            k--
+        }
+        return minBound
+    }
+
+    private fun findDialogueStartForOrphanClose(text: String, startBound: Int, closeQuoteIndex: Int): Int {
+        var lastTerminatorEnd = -1
+
+        var k = startBound
+        while (k < closeQuoteIndex) {
+            val ch = text[k]
+            if (ch == '.' && isSinglePeriod(text, k)) {
+                if (k + 1 < closeQuoteIndex && text[k + 1].isWhitespace()) {
+                    lastTerminatorEnd = k + 1
+                }
+            } else if (ch == ':' && k + 1 < closeQuoteIndex && text[k + 1].isWhitespace()) {
+                lastTerminatorEnd = k + 1
+            }
+            k++
+        }
+
+        if (lastTerminatorEnd != -1) {
+            val candidateStart = findNextNonWhitespace(text, lastTerminatorEnd)
+            if (candidateStart < closeQuoteIndex) {
+                return candidateStart
+            }
+        }
+
+        val nonWsStart = findNextNonWhitespace(text, startBound)
+        return if (nonWsStart < closeQuoteIndex) nonWsStart else startBound
+    }
+
+    private fun isSinglePeriod(text: String, index: Int): Boolean {
+        val prev = if (index > 0) text[index - 1] else null
+        val next = if (index + 1 < text.length) text[index + 1] else null
+        return prev != '.' && next != '.'
     }
 
     private fun extractDialogue(
