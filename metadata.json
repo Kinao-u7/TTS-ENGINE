@@ -1,0 +1,6 @@
+{
+  "name": "Novel Reader Multi-Voice TTS",
+  "description": "Multi-voice text-to-speech engine with character voice assignment and narration for novel reading.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
