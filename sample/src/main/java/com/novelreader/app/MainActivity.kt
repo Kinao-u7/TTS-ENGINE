@@ -161,7 +161,7 @@ fun ReaderScreen(
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
-            alignItems = Alignment.CenterVertically
+            verticalAlignment = Alignment.CenterVertically
         ) {
             Column {
                 Text(
