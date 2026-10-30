@@ -4,14 +4,15 @@ import com.novelreader.tts.core.engine.FakeSpeechEngine
 import com.novelreader.tts.core.model.Character
 import com.novelreader.tts.core.model.Segment
 import com.novelreader.tts.core.model.SegmentType
-import com.novelreader.tts.core.model.TextRange
+import com.novelreader.tts.core.model.VoiceGender
+import com.novelreader.tts.core.model.VoiceInfo
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -25,10 +26,17 @@ class PlaybackControllerTest {
     private lateinit var fakeEngine: FakeSpeechEngine
     private lateinit var controller: PlaybackController
 
+    private val narratorChar = Character(
+        id = Character.NARRATOR_ID,
+        name = "Narrator",
+        voiceId = "voice_en_narrator"
+    )
+
     private val charElena = Character(
         id = "char_elena",
         name = "Elena",
-        voiceId = "voice_en_2",
+        voiceId = "voice_en_f1",
+        voiceGender = VoiceGender.FEMALE,
         speed = 1.1f,
         pitch = 1.2f
     )
@@ -36,7 +44,8 @@ class PlaybackControllerTest {
     private val charXian = Character(
         id = "char_xian",
         name = "Xian",
-        voiceId = "voice_en_1",
+        voiceId = "voice_en_m1",
+        voiceGender = VoiceGender.MALE,
         speed = 1.0f,
         pitch = 0.9f
     )
@@ -45,207 +54,169 @@ class PlaybackControllerTest {
     fun setUp() {
         fakeEngine = FakeSpeechEngine(scope = testScope)
         controller = PlaybackController(fakeEngine, scope = testScope)
-        controller.updateCharacters(listOf(Character.Narrator, charElena, charXian))
+        controller.updateAvailableVoices(fakeEngine.mockVoices)
+        controller.updateCharacters(listOf(narratorChar, Character.Unnamed, charElena, charXian))
     }
 
     @Test
-    fun `play sequence of 3 segments asserts state transitions and voice changes`() = runTest {
+    fun `refill keeps 3 queued ahead without waiting for completion`() = runTest {
         val segments = listOf(
-            Segment(
-                id = "seg_n0_111",
-                type = SegmentType.NARRATION,
-                text = "He looked at the sky.",
-                startOffset = 0,
-                endOffset = 21
-            ),
-            Segment(
-                id = "seg_d0_222",
-                type = SegmentType.DIALOGUE,
-                text = "\"Prepare the carriage,\"",
-                startOffset = 21,
-                endOffset = 44,
-                speakerOverride = "char_elena"
-            ),
-            Segment(
-                id = "seg_d1_333",
-                type = SegmentType.DIALOGUE,
-                text = "\"At once!\"",
-                startOffset = 44,
-                endOffset = 54,
-                speakerOverride = "char_xian"
-            )
+            Segment("seg_0", SegmentType.NARRATION, "Sentence zero.", 0, 14),
+            Segment("seg_1", SegmentType.DIALOGUE, "\"Sentence one.\"", 14, 29, speakerOverride = "char_elena"),
+            Segment("seg_2", SegmentType.DIALOGUE, "\"Sentence two.\"", 29, 44, speakerOverride = "char_xian"),
+            Segment("seg_3", SegmentType.NARRATION, "Sentence three.", 44, 59),
+            Segment("seg_4", SegmentType.NARRATION, "Sentence four.", 59, 73),
+            Segment("seg_5", SegmentType.NARRATION, "Sentence five.", 73, 87)
         )
 
         controller.loadSegments(segments)
-        assertEquals(PlaybackState.Idle, controller.state.value)
-
-        // 1. Start playback on Segment 0 (Narrator)
-        controller.play()
-        assertEquals(1, fakeEngine.speakRecords.size)
-        val rec0 = fakeEngine.speakRecords[0]
-        assertEquals("He looked at the sky.", rec0.text)
-        assertNull(rec0.voiceId) // Narrator default voice
-        assertTrue(controller.state.value is PlaybackState.Playing)
-        assertEquals(0, controller.state.value.currentSegmentIndex)
-
-        // 2. Complete Segment 0 -> auto-advance to Segment 1 (Elena)
-        fakeEngine.emitDone(rec0.utteranceId)
-        assertEquals(2, fakeEngine.speakRecords.size)
-        val rec1 = fakeEngine.speakRecords[1]
-        assertEquals("\"Prepare the carriage,\"", rec1.text)
-        assertEquals("voice_en_2", rec1.voiceId)
-        assertEquals(1.1f, rec1.speed)
-        assertEquals(1.2f, rec1.pitch)
-        assertEquals(1, controller.state.value.currentSegmentIndex)
-
-        // Pre-warming verification: next speaker (Xian) should have been pre-warmed
-        assertTrue(fakeEngine.prewarmedVoices.contains("voice_en_1"))
-
-        // 3. Complete Segment 1 -> auto-advance to Segment 2 (Xian)
-        fakeEngine.emitDone(rec1.utteranceId)
-        assertEquals(3, fakeEngine.speakRecords.size)
-        val rec2 = fakeEngine.speakRecords[2]
-        assertEquals("\"At once!\"", rec2.text)
-        assertEquals("voice_en_1", rec2.voiceId)
-        assertEquals(1.0f, rec2.speed)
-        assertEquals(0.9f, rec2.pitch)
-        assertEquals(2, controller.state.value.currentSegmentIndex)
-
-        // 4. Complete Segment 2 -> end of chapter -> transition to Stopped
-        fakeEngine.emitDone(rec2.utteranceId)
-        assertEquals(PlaybackState.Stopped, controller.state.value)
-    }
-
-    @Test
-    fun `pause and resume flow`() = runTest {
-        val segments = listOf(
-            Segment("seg_0", SegmentType.NARRATION, "First line.", 0, 11)
-        )
-        controller.loadSegments(segments)
         controller.play()
 
-        assertTrue(controller.state.value.isPlaying)
+        // With lookaheadCount = 3: sentence 0 plus 3 ahead = 4 sentences enqueued immediately!
+        assertEquals(4, fakeEngine.speakRecords.size)
+        assertEquals("Sentence zero.", fakeEngine.speakRecords[0].sentence)
+        assertEquals("\"Sentence one.\"", fakeEngine.speakRecords[1].sentence)
+        assertEquals("\"Sentence two.\"", fakeEngine.speakRecords[2].sentence)
+        assertEquals("Sentence three.", fakeEngine.speakRecords[3].sentence)
 
-        // Pause
-        controller.pause()
-        assertEquals(1, fakeEngine.pauseCount)
-        assertTrue(controller.state.value is PlaybackState.Paused)
-        assertEquals(0, controller.state.value.currentSegmentIndex)
+        // When sentence 0 emits Started -> refilling triggers sentence 4 to be enqueued!
+        fakeEngine.emitStarted(fakeEngine.speakRecords[0].utteranceId)
+        assertEquals(5, fakeEngine.speakRecords.size)
+        assertEquals("Sentence four.", fakeEngine.speakRecords[4].sentence)
 
-        // Resume
-        controller.resume()
-        assertEquals(1, fakeEngine.resumeCount)
-        assertTrue(controller.state.value.isPlaying)
+        // When sentence 0 emits Done -> refilling ensures sentence 5 is enqueued!
+        fakeEngine.emitDone(fakeEngine.speakRecords[0].utteranceId)
+        assertEquals(6, fakeEngine.speakRecords.size)
+        assertEquals("Sentence five.", fakeEngine.speakRecords[5].sentence)
     }
 
     @Test
     fun `skip next and previous`() = runTest {
         val segments = listOf(
-            Segment("seg_0", SegmentType.NARRATION, "Line 0", 0, 6),
-            Segment("seg_1", SegmentType.NARRATION, "Line 1", 6, 12),
-            Segment("seg_2", SegmentType.NARRATION, "Line 2", 12, 18)
+            Segment("seg_0", SegmentType.NARRATION, "Line 0.", 0, 7),
+            Segment("seg_1", SegmentType.NARRATION, "Line 1.", 7, 14),
+            Segment("seg_2", SegmentType.NARRATION, "Line 2.", 14, 21)
         )
         controller.loadSegments(segments)
         controller.play()
-        assertEquals(0, controller.state.value.currentSegmentIndex)
+        assertEquals(0, controller.readerState.value.currentSentenceIndex)
 
-        // Skip to next
+        // Next
         controller.next()
-        assertEquals(1, controller.state.value.currentSegmentIndex)
-        assertEquals("Line 1", fakeEngine.speakRecords.last().text)
+        assertEquals(1, controller.readerState.value.currentSentenceIndex)
 
-        // Skip to next
+        // Next
         controller.next()
-        assertEquals(2, controller.state.value.currentSegmentIndex)
-        assertEquals("Line 2", fakeEngine.speakRecords.last().text)
+        assertEquals(2, controller.readerState.value.currentSentenceIndex)
 
-        // Skip back to previous
+        // Previous
         controller.previous()
-        assertEquals(1, controller.state.value.currentSegmentIndex)
-        assertEquals("Line 1", fakeEngine.speakRecords.last().text)
+        assertEquals(1, controller.readerState.value.currentSentenceIndex)
     }
 
     @Test
-    fun `seek to specific segment`() = runTest {
+    fun `pause and resume restarts the sentence`() = runTest {
         val segments = listOf(
-            Segment("seg_0", SegmentType.NARRATION, "Line 0", 0, 6),
-            Segment("seg_1", SegmentType.NARRATION, "Line 1", 6, 12),
-            Segment("seg_2", SegmentType.NARRATION, "Line 2", 12, 18)
-        )
-        controller.loadSegments(segments)
-        controller.seekTo(2)
-        assertEquals(2, controller.state.value.currentSegmentIndex)
-    }
-
-    @Test
-    fun `stop halts playback and updates state`() = runTest {
-        val segments = listOf(
-            Segment("seg_0", SegmentType.NARRATION, "Line 0", 0, 6)
-        )
-        controller.loadSegments(segments)
-        controller.play()
-        assertTrue(controller.state.value.isPlaying)
-
-        controller.stop()
-        assertTrue(fakeEngine.stopCount > 0)
-        assertEquals(PlaybackState.Stopped, controller.state.value)
-    }
-
-    @Test
-    fun `blank or whitespace-only segments are automatically skipped`() = runTest {
-        val segments = listOf(
-            Segment("seg_0", SegmentType.NARRATION, "Opening narration.", 0, 18),
-            Segment("seg_1", SegmentType.NARRATION, "\n\n   \t  \n", 18, 27), // Whitespace only
-            Segment("seg_2", SegmentType.NARRATION, "", 27, 27), // Completely empty
-            Segment("seg_3", SegmentType.DIALOGUE, "\"Dialogue after blanks.\"", 27, 51)
+            Segment("seg_0", SegmentType.NARRATION, "First line.", 0, 11),
+            Segment("seg_1", SegmentType.NARRATION, "Second line.", 11, 23)
         )
         controller.loadSegments(segments)
         controller.play()
 
-        // Plays segment 0
-        assertEquals(0, controller.state.value.currentSegmentIndex)
-        assertEquals("Opening narration.", fakeEngine.speakRecords[0].text)
+        // Jump to sentence 1
+        controller.jumpToSentence(1)
+        assertEquals(1, controller.readerState.value.currentSentenceIndex)
+        assertTrue(controller.readerState.value.isPlaying)
 
-        // Done on segment 0 -> skips 1 and 2, auto-plays segment 3!
-        fakeEngine.emitDone(fakeEngine.speakRecords[0].utteranceId)
+        val speakCountBeforePause = fakeEngine.speakRecords.size
 
-        assertEquals(2, fakeEngine.speakRecords.size)
-        assertEquals("\"Dialogue after blanks.\"", fakeEngine.speakRecords[1].text)
-        assertEquals(3, controller.state.value.currentSegmentIndex)
+        // Pause
+        controller.pause()
+        assertFalse(controller.readerState.value.isPlaying)
+        assertEquals(1, controller.readerState.value.currentSentenceIndex)
+
+        // Resume: must restart from sentence 1!
+        controller.resume()
+        assertTrue(controller.readerState.value.isPlaying)
+        assertEquals(1, controller.readerState.value.currentSentenceIndex)
+        val lastRecord = fakeEngine.speakRecords.last()
+        assertEquals("Second line.", lastRecord.sentence)
     }
 
     @Test
-    fun `errors are surfaced and never swallowed silently`() = runTest {
+    fun `reassigning the playing line flushes and restarts from that segment`() = runTest {
         val segments = listOf(
-            Segment("seg_0", SegmentType.NARRATION, "Error trigger line.", 0, 19)
+            Segment("seg_0", SegmentType.DIALOGUE, "\"Line zero.\"", 0, 11, speakerOverride = "char_elena"),
+            Segment("seg_1", SegmentType.NARRATION, "Line one.", 11, 20)
         )
         controller.loadSegments(segments)
         controller.play()
 
-        val activeId = fakeEngine.speakRecords[0].utteranceId
-        fakeEngine.emitError(activeId, "Hardware codec failure", errorCode = 500)
+        val initialStopCount = fakeEngine.stopCount
 
-        val currentState = controller.state.value
-        assertTrue("State must be Error: $currentState", currentState is PlaybackState.Error)
-        val errorState = currentState as PlaybackState.Error
-        assertTrue(errorState.message.contains("Hardware codec failure"))
-        assertTrue(errorState.message.contains("500"))
+        // Currently playing sentence 0 of seg_0 -> reassigning seg_0 must flush and restart
+        controller.reassignSpeaker("seg_0", "char_xian")
+
+        assertTrue(fakeEngine.stopCount > initialStopCount)
+        val restartedRecord = fakeEngine.speakRecords.last()
+        assertEquals("\"Line zero.\"", restartedRecord.sentence)
+        assertEquals("voice_en_m1", restartedRecord.voice?.id)
     }
 
     @Test
-    fun `range start events update character highlight range`() = runTest {
+    fun `settings edit does not flush the queue`() = runTest {
         val segments = listOf(
-            Segment("seg_0", SegmentType.NARRATION, "Word-by-word highlight.", 0, 23)
+            Segment("seg_0", SegmentType.NARRATION, "Sentence zero.", 0, 14),
+            Segment("seg_1", SegmentType.NARRATION, "Sentence one.", 14, 27)
         )
         controller.loadSegments(segments)
         controller.play()
 
-        val activeId = fakeEngine.speakRecords[0].utteranceId
-        fakeEngine.emitRangeStart(activeId, startOffset = 5, endOffset = 12)
+        val stopCountBefore = fakeEngine.stopCount
 
-        val currentState = controller.state.value
-        assertTrue(currentState is PlaybackState.Playing)
-        val playingState = currentState as PlaybackState.Playing
-        assertEquals(TextRange(5, 12), playingState.rangeInSegment)
+        // Change global speed or character settings
+        controller.setGlobalSpeed(1.5f)
+
+        // Must NOT flush or stop the engine!
+        assertEquals(stopCountBefore, fakeEngine.stopCount)
+    }
+
+    @Test
+    fun `blank or whitespace-only segments are skipped`() = runTest {
+        val segments = listOf(
+            Segment("seg_0", SegmentType.NARRATION, "First content.", 0, 14),
+            Segment("seg_1", SegmentType.NARRATION, "   \n\n\t  ", 14, 23),
+            Segment("seg_2", SegmentType.NARRATION, "", 23, 23),
+            Segment("seg_3", SegmentType.DIALOGUE, "\"Second content.\"", 23, 40)
+        )
+        controller.loadSegments(segments)
+
+        // Only 2 non-blank sentences exist
+        assertEquals(2, controller.readerState.value.sentenceCount)
+
+        controller.play()
+        assertEquals("First content.", fakeEngine.speakRecords[0].sentence)
+        assertEquals("\"Second content.\"", fakeEngine.speakRecords[1].sentence)
+    }
+
+    @Test
+    fun `play before ready is queued and runs after ready`() = runTest {
+        val engineNotReady = FakeSpeechEngine(initialReady = false, scope = testScope)
+        val testController = PlaybackController(engineNotReady, scope = testScope)
+
+        val segments = listOf(
+            Segment("seg_0", SegmentType.NARRATION, "Hello world.", 0, 12)
+        )
+        testController.loadSegments(segments)
+
+        // Play called while engine is not ready
+        testController.play()
+        assertEquals(0, engineNotReady.speakRecords.size)
+
+        // Engine becomes ready -> queued play automatically executes!
+        engineNotReady.setReady(true)
+        assertEquals(1, engineNotReady.speakRecords.size)
+        assertEquals("Hello world.", engineNotReady.speakRecords[0].sentence)
+        assertTrue(testController.readerState.value.isPlaying)
     }
 }

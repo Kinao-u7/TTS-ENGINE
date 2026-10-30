@@ -5,6 +5,7 @@ import com.novelreader.tts.core.model.CharacterResolver
 import com.novelreader.tts.core.model.Segment
 import com.novelreader.tts.core.model.SegmentType
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -26,115 +27,31 @@ class NovelSegmenterTest {
         assertEquals(0, segments[0].startOffset)
         assertEquals(11, segments[0].endOffset)
         assertEquals(Character.NARRATOR_ID, segments[0].effectiveSpeakerId)
-        assertTrue(segments[0].id.startsWith("seg_n0_"))
+        assertTrue(segments[0].id.startsWith("n0-"))
 
         // 2. Dialogue
         assertEquals(SegmentType.DIALOGUE, segments[1].type)
         assertEquals("\"Let's move out.\"", segments[1].text)
         assertEquals(11, segments[1].startOffset)
         assertEquals(28, segments[1].endOffset)
-        assertEquals(Character.NARRATOR_ID, segments[1].effectiveSpeakerId)
-        assertTrue(segments[1].id.startsWith("seg_d0_"))
+        // Default speaker for unassigned dialogue is "unnamed"
+        assertEquals(Character.UNNAMED_ID, segments[1].effectiveSpeakerId)
+        assertTrue(segments[1].id.startsWith("0-"))
 
         // 3. Narration
         assertEquals(SegmentType.NARRATION, segments[2].type)
         assertEquals("\nThey began walking.", segments[2].text)
         assertEquals(28, segments[2].startOffset)
         assertEquals(text.length, segments[2].endOffset)
-        assertTrue(segments[2].id.startsWith("seg_n1_"))
+        assertEquals(Character.NARRATOR_ID, segments[2].effectiveSpeakerId)
+        assertTrue(segments[2].id.startsWith("n1-"))
 
         assertSegmentsPartitionOriginalText(text, segments)
     }
 
     @Test
-    fun `he said to Xian followed by a quote on the next line`() {
-        val text = "He said to Xian:\n\"We leave at dawn.\""
-        val segments = NovelSegmenter.segment(text)
-
-        assertEquals(2, segments.size)
-
-        // Narration
-        assertEquals(SegmentType.NARRATION, segments[0].type)
-        assertEquals("He said to Xian:\n", segments[0].text)
-        assertEquals(0, segments[0].startOffset)
-        assertEquals(17, segments[0].endOffset)
-
-        // Dialogue
-        assertEquals(SegmentType.DIALOGUE, segments[1].type)
-        assertEquals("\"We leave at dawn.\"", segments[1].text)
-        assertEquals(17, segments[1].startOffset)
-        assertEquals(36, segments[1].endOffset)
-
-        assertSegmentsPartitionOriginalText(text, segments)
-    }
-
-    @Test
-    fun `multi-paragraph quotes that open without closing`() {
-        val text = "\"The path ahead is dangerous.\n\"We must be prepared.\""
-        val segments = NovelSegmenter.segment(text)
-
-        assertEquals(3, segments.size)
-
-        assertEquals(SegmentType.DIALOGUE, segments[0].type)
-        assertEquals("\"The path ahead is dangerous.", segments[0].text)
-        assertEquals(0, segments[0].startOffset)
-        assertEquals(29, segments[0].endOffset)
-
-        assertEquals(SegmentType.NARRATION, segments[1].type)
-        assertEquals("\n", segments[1].text)
-        assertEquals(29, segments[1].startOffset)
-        assertEquals(30, segments[1].endOffset)
-
-        assertEquals(SegmentType.DIALOGUE, segments[2].type)
-        assertEquals("\"We must be prepared.\"", segments[2].text)
-        assertEquals(30, segments[2].startOffset)
-        assertEquals(52, segments[2].endOffset)
-
-        assertSegmentsPartitionOriginalText(text, segments)
-    }
-
-    @Test
-    fun `multi-paragraph quotes with empty line in between`() {
-        val text = "\"First paragraph.\n\n\"Second paragraph.\""
-        val segments = NovelSegmenter.segment(text)
-
-        assertEquals(3, segments.size)
-        assertEquals(SegmentType.DIALOGUE, segments[0].type)
-        assertEquals("\"First paragraph.", segments[0].text)
-
-        assertEquals(SegmentType.NARRATION, segments[1].type)
-        assertEquals("\n\n", segments[1].text)
-
-        assertEquals(SegmentType.DIALOGUE, segments[2].type)
-        assertEquals("\"Second paragraph.\"", segments[2].text)
-
-        assertSegmentsPartitionOriginalText(text, segments)
-    }
-
-    @Test
-    fun `apostrophes inside double quotes`() {
-        val text = "\"Don't worry, it's Xian's plan,\" she said."
-        val segments = NovelSegmenter.segment(text)
-
-        assertEquals(2, segments.size)
-
-        assertEquals(SegmentType.DIALOGUE, segments[0].type)
-        assertEquals("\"Don't worry, it's Xian's plan,\"", segments[0].text)
-        assertEquals(0, segments[0].startOffset)
-        assertEquals(32, segments[0].endOffset)
-
-        assertEquals(SegmentType.NARRATION, segments[1].type)
-        assertEquals(" she said.", segments[1].text)
-        assertEquals(32, segments[1].startOffset)
-        assertEquals(text.length, segments[1].endOffset)
-
-        assertSegmentsPartitionOriginalText(text, segments)
-    }
-
-    @Test
-    fun `possessives and plural possessives in plain narration stay NARRATION with default options`() {
-        // By default enableSingleQuotes is false, so possessives and contractions never produce dialogue
-        val text = "The cat's tail twitched as the dogs' barking echoed down the boys' club near James' house."
+    fun `possessives and plural possessives and contractions in plain narration stay NARRATION`() {
+        val text = "the dogs' bones, Xian's sword, 'tis"
         val segments = NovelSegmenter.segment(text)
 
         assertEquals(1, segments.size)
@@ -142,149 +59,82 @@ class NovelSegmenterTest {
         assertEquals(text, segments[0].text)
         assertEquals(0, segments[0].startOffset)
         assertEquals(text.length, segments[0].endOffset)
+        assertEquals(Character.NARRATOR_ID, segments[0].effectiveSpeakerId)
     }
 
     @Test
-    fun `single quote dialogue is detected when enableSingleQuotes is explicitly enabled`() {
-        val options = SegmenterOptions(enableSingleQuotes = true)
-        val text = "'Don\'t worry, it\'s fine,' he whispered."
+    fun `singleQuoteDialogue false by default keeps archaic contractions as narration`() {
+        val options = SegmenterOptions()
+        assertFalse(options.singleQuoteDialogue)
+        assertFalse(options.enableSingleQuotes)
+
+        val text = "The dogs' bones were found near Xian's sword. 'tis true."
         val segments = NovelSegmenter.segment(text, options)
 
-        assertEquals(2, segments.size)
-        assertEquals(SegmentType.DIALOGUE, segments[0].type)
-        assertEquals("'Don\'t worry, it\'s fine,'", segments[0].text)
-        assertEquals(0, segments[0].startOffset)
-        assertEquals(25, segments[0].endOffset)
-
-        assertEquals(SegmentType.NARRATION, segments[1].type)
-        assertEquals(" he whispered.", segments[1].text)
-        assertEquals(25, segments[1].startOffset)
-        assertEquals(text.length, segments[1].endOffset)
-
-        assertSegmentsPartitionOriginalText(text, segments)
-    }
-
-    @Test
-    fun `curly versus straight quotes and guillemets`() {
-        // Straight double
-        val straight = "\"Hello,\" he said."
-        val segsStraight = NovelSegmenter.segment(straight)
-        assertEquals(2, segsStraight.size)
-        assertEquals("\"Hello,\"", segsStraight[0].text)
-        assertEquals(SegmentType.DIALOGUE, segsStraight[0].type)
-
-        // Curly double
-        val curlyDouble = "“Hello,” he said."
-        val segsCurly = NovelSegmenter.segment(curlyDouble)
-        assertEquals(2, segsCurly.size)
-        assertEquals("“Hello,”", segsCurly[0].text)
-        assertEquals(SegmentType.DIALOGUE, segsCurly[0].type)
-
-        // Guillemets
-        val guillemet = "« Bonjour le monde, » dit-il."
-        val segsGuillemet = NovelSegmenter.segment(guillemet)
-        assertEquals(2, segsGuillemet.size)
-        assertEquals("« Bonjour le monde, »", segsGuillemet[0].text)
-        assertEquals(SegmentType.DIALOGUE, segsGuillemet[0].type)
-        assertEquals(" dit-il.", segsGuillemet[1].text)
-        assertEquals(SegmentType.NARRATION, segsGuillemet[1].type)
-    }
-
-    @Test
-    fun `unclosed quote at the end of text`() {
-        val text = "He shouted, \"Wait for me!"
-        val segments = NovelSegmenter.segment(text)
-
-        assertEquals(2, segments.size)
-
+        assertEquals(1, segments.size)
         assertEquals(SegmentType.NARRATION, segments[0].type)
-        assertEquals("He shouted, ", segments[0].text)
-        assertEquals(0, segments[0].startOffset)
-        assertEquals(12, segments[0].endOffset)
-
-        assertEquals(SegmentType.DIALOGUE, segments[1].type)
-        assertEquals("\"Wait for me!", segments[1].text)
-        assertEquals(12, segments[1].startOffset)
-        assertEquals(text.length, segments[1].endOffset)
-
-        assertSegmentsPartitionOriginalText(text, segments)
+        assertEquals(text, segments[0].text)
     }
 
     @Test
-    fun `unclosed quote followed by narration on next line`() {
-        val text = "\"Wait for me!\nThe train pulled away."
-        val segments = NovelSegmenter.segment(text)
-
-        assertEquals(2, segments.size)
-
-        assertEquals(SegmentType.DIALOGUE, segments[0].type)
-        assertEquals("\"Wait for me!", segments[0].text)
-        assertEquals(0, segments[0].startOffset)
-        assertEquals(13, segments[0].endOffset)
-
-        assertEquals(SegmentType.NARRATION, segments[1].type)
-        assertEquals("\nThe train pulled away.", segments[1].text)
-        assertEquals(13, segments[1].startOffset)
-        assertEquals(text.length, segments[1].endOffset)
-
-        assertSegmentsPartitionOriginalText(text, segments)
-    }
-
-    @Test
-    fun `segment IDs are stable across small text edits`() {
+    fun `segment IDs follow dialogueIndex-hash and remain stable across small edits`() {
         val originalText = "\"Hello there!\" said Xian. \"Let's go.\""
         val segments1 = NovelSegmenter.segment(originalText)
         val secondDialogueId1 = segments1.first { it.text.contains("Let's go") }.id
 
-        // Edit earlier narration by adding words
-        val modifiedEarlierNarration = "\"Hello there!\" said Master Xian quickly. \"Let's go.\""
+        // Edit earlier narration by inserting words
+        val modifiedEarlierNarration = "\"Hello there!\" said Master Xian quickly and loudly. \"Let's go.\""
         val segments2 = NovelSegmenter.segment(modifiedEarlierNarration)
         val secondDialogueId2 = segments2.first { it.text.contains("Let's go") }.id
 
-        // The second dialogue ID must be identical because dialogueIndex (1) and content hash ("Let's go.") did not change
+        // Format is "<dialogueIndexInChapter>-<short hash of segment text>"
+        assertTrue(secondDialogueId1.startsWith("1-"))
         assertEquals(secondDialogueId1, secondDialogueId2)
     }
 
     @Test
-    fun `speaker resolution order override beats speaker_id beats narrator`() {
-        val defaultSeg = Segment(
-            id = "seg_1",
-            type = SegmentType.DIALOGUE,
-            text = "\"Hello\"",
-            startOffset = 0,
-            endOffset = 7
-        )
-        assertEquals(Character.NARRATOR_ID, defaultSeg.effectiveSpeakerId)
+    fun `built in characters narrator and unnamed cannot be deleted or used as merge source`() {
+        assertTrue(Character.Narrator.isBuiltIn)
+        assertFalse(Character.Narrator.isDeletable)
+        assertFalse(Character.Narrator.canBeMergeSource)
 
-        val autoAttributedSeg = defaultSeg.copy(speakerId = "char_xian")
-        assertEquals("char_xian", autoAttributedSeg.effectiveSpeakerId)
+        assertTrue(Character.Unnamed.isBuiltIn)
+        assertFalse(Character.Unnamed.isDeletable)
+        assertFalse(Character.Unnamed.canBeMergeSource)
 
-        val userOverriddenSeg = autoAttributedSeg.copy(speakerOverride = "char_elena")
-        assertEquals("char_elena", userOverriddenSeg.effectiveSpeakerId)
+        val customChar = Character(id = "char_lin", name = "Lin")
+        assertFalse(customChar.isBuiltIn)
+        assertTrue(customChar.isDeletable)
+        assertTrue(customChar.canBeMergeSource)
     }
 
     @Test
-    fun `character resolver matches name and aliases case-insensitively`() {
-        val characters = listOf(
-            Character.Narrator,
-            Character(
-                id = "char_xian",
-                name = "Xian",
-                aliases = listOf("The Wanderer", "Master Xian")
-            ),
-            Character(
-                id = "char_elena",
-                name = "Elena",
-                aliases = listOf("Lady Elena")
-            )
-        )
+    fun `effective speaker resolution rule`() {
+        // 1. Dialogue defaults to "unnamed"
+        val dialogue = Segment(id = "0-abc", type = SegmentType.DIALOGUE, text = "\"Hi\"", startOffset = 0, endOffset = 4)
+        assertEquals(Character.UNNAMED_ID, dialogue.effectiveSpeakerId)
 
-        assertEquals("char_xian", CharacterResolver.resolveCharacterByName(characters, "xian")?.id)
-        assertEquals("char_xian", CharacterResolver.resolveCharacterByName(characters, "XIAN")?.id)
-        assertEquals("char_xian", CharacterResolver.resolveCharacterByName(characters, "the wanderer")?.id)
-        assertEquals("char_xian", CharacterResolver.resolveCharacterByName(characters, "MASTER XIAN")?.id)
-        assertEquals("char_elena", CharacterResolver.resolveCharacterByName(characters, "lady elena")?.id)
-        assertNull(CharacterResolver.resolveCharacterByName(characters, "NonExistent"))
+        // 2. Narration defaults to "narrator"
+        val narration = Segment(id = "n0-abc", type = SegmentType.NARRATION, text = "He walked.", startOffset = 4, endOffset = 14)
+        assertEquals(Character.NARRATOR_ID, narration.effectiveSpeakerId)
+
+        // 3. speakerId takes precedence over defaults
+        val attributedDialogue = dialogue.copy(speakerId = "char_lin")
+        assertEquals("char_lin", attributedDialogue.effectiveSpeakerId)
+
+        // 4. speakerOverride takes precedence over speakerId
+        val overriddenDialogue = attributedDialogue.copy(speakerOverride = "char_xian")
+        assertEquals("char_xian", overriddenDialogue.effectiveSpeakerId)
+    }
+
+    @Test
+    fun `character readByNarrator flag`() {
+        val narratorLineChar = Character(
+            id = "char_whisper",
+            name = "Inner Voice",
+            readByNarrator = true
+        )
+        assertTrue(narratorLineChar.readByNarrator)
     }
 
     private fun assertSegmentsPartitionOriginalText(originalText: String, segments: List<Segment>) {

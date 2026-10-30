@@ -1,68 +1,88 @@
 package com.novelreader.tts.core.engine
 
 import com.novelreader.tts.core.model.VoiceInfo
+import com.novelreader.tts.core.model.VoiceSettings
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 
 /**
  * Abstraction layer for text-to-speech synthesis engines.
+ *
+ * Nothing outside the engine implementation may touch platform TextToSpeech.
  */
 interface SpeechEngine {
 
     /**
-     * Observable lifecycle state of this engine.
+     * Observable readiness state of the engine.
      */
-    val engineState: StateFlow<EngineState>
+    val isReady: StateFlow<Boolean>
 
     /**
-     * Stream of utterance synthesis events (started, range started, done, error).
+     * Stream of utterance synthesis events (Started, Range(start, end), Done, Error).
      */
     val events: Flow<SpeechEvent>
 
     /**
-     * Synthesizes and plays the provided text.
+     * Synthesizes and plays the provided sentence.
      *
-     * @param utteranceId Unique ID to correlate speech events.
-     * @param text The plain text to speak.
-     * @param voiceId The voice identifier to use (or null for default).
-     * @param speed Playback rate multiplier (1.0f = normal).
-     * @param pitch Pitch multiplier (1.0f = normal).
+     * @param sentence The plain text sentence to speak.
+     * @param voice The voice profile to use (or null for default narrator voice).
+     * @param settings Pitch and speed rate multipliers.
+     * @param utteranceId Identifier to correlate speech events.
      */
     fun speak(
-        utteranceId: String,
-        text: String,
-        voiceId: String? = null,
-        speed: Float = 1.0f,
-        pitch: Float = 1.0f
+        sentence: String,
+        voice: VoiceInfo? = null,
+        settings: VoiceSettings = VoiceSettings.Default,
+        utteranceId: String = "utt_${System.currentTimeMillis()}_${(0..99999).random()}"
     )
 
     /**
-     * Stops current speech synthesis immediately.
+     * Stops current speech synthesis immediately and clears pending utterances in engine.
      */
     fun stop()
 
     /**
-     * Pauses current playback if supported by the engine.
+     * Pre-warms the engine or specific voice assets ahead of playback.
      */
-    fun pause()
+    fun warmUp(voice: VoiceInfo? = null)
 
     /**
-     * Resumes playback if paused.
+     * Releases system resources held by the engine.
      */
-    fun resume()
+    fun release()
 
     /**
-     * Returns the list of currently installed and available voices.
+     * Backward-compatible helper for available voices.
      */
-    fun getAvailableVoices(): List<VoiceInfo>
+    fun getAvailableVoices(): List<VoiceInfo> = emptyList()
 
     /**
-     * Optional optimization hint to warm up voice assets ahead of time.
+     * Backward-compatible lifecycle state.
+     */
+    val engineState: StateFlow<EngineState>? get() = null
+
+    /**
+     * Backward-compatible pause support.
+     */
+    fun pause() {
+        stop()
+    }
+
+    /**
+     * Backward-compatible resume support.
+     */
+    fun resume() {}
+
+    /**
+     * Backward-compatible shutdown alias for release.
+     */
+    fun shutdown() {
+        release()
+    }
+
+    /**
+     * Backward-compatible prewarm alias.
      */
     fun prewarm(voiceId: String?) {}
-
-    /**
-     * Releases resources held by the engine.
-     */
-    fun shutdown() {}
 }

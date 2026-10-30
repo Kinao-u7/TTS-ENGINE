@@ -14,18 +14,20 @@ sealed interface EngineState {
  * Real-time speech synthesis progress events.
  */
 sealed interface SpeechEvent {
-    data class Started(val utteranceId: String) : SpeechEvent
+    val utteranceId: String
 
-    data class RangeStarted(
-        val utteranceId: String,
-        val startOffset: Int,
-        val endOffset: Int
+    data class Started(override val utteranceId: String) : SpeechEvent
+
+    data class Range(
+        val start: Int,
+        val end: Int,
+        override val utteranceId: String = ""
     ) : SpeechEvent
 
-    data class Done(val utteranceId: String) : SpeechEvent
+    data class Done(override val utteranceId: String) : SpeechEvent
 
     data class Error(
-        val utteranceId: String,
+        override val utteranceId: String,
         val message: String,
         val errorCode: Int = 0
     ) : SpeechEvent

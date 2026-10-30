@@ -6,14 +6,16 @@ package com.novelreader.tts.core.model
  * @property id Unique voice identifier (e.g. system voice name or identifier).
  * @property name Human-readable display name.
  * @property locale BCP-47 language tag or locale string (e.g. "en-US").
+ * @property gender Gender profile of the voice (MALE/FEMALE/ANY).
  * @property quality Quality rating (e.g. normal, high).
  * @property latency Latency rating.
  * @property requiresNetwork Whether this voice requires an active internet connection.
  */
 data class VoiceInfo(
     val id: String,
-    val name: String,
+    val name: String = id,
     val locale: String,
+    val gender: VoiceGender = VoiceGender.ANY,
     val quality: Int = QUALITY_NORMAL,
     val latency: Int = LATENCY_NORMAL,
     val requiresNetwork: Boolean = false

@@ -1,11 +1,14 @@
 package com.novelreader.tts.core.playback
 
-import com.novelreader.tts.core.engine.EngineState
 import com.novelreader.tts.core.engine.SpeechEngine
 import com.novelreader.tts.core.engine.SpeechEvent
 import com.novelreader.tts.core.model.Character
 import com.novelreader.tts.core.model.Segment
+import com.novelreader.tts.core.model.SegmentType
 import com.novelreader.tts.core.model.TextRange
+import com.novelreader.tts.core.model.VoiceInfo
+import com.novelreader.tts.core.model.VoiceSelectionResult
+import com.novelreader.tts.core.model.VoiceSelector
 import com.novelreader.tts.core.model.VoiceSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -13,36 +16,98 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 /**
- * Controller coordinating segment progression, voice attribution, and speech synthesis.
- *
- * Automatically skips blank and whitespace-only segments.
+ * Speaker chip information exposed to the reader player UI.
+ */
+data class SpeakerChipInfo(
+    val id: String,
+    val displayName: String
+)
+
+/**
+ * Observable reader state exposing sentence progression, character highlights,
+ * speaker chip metadata, and time remaining.
+ */
+data class ReaderState(
+    val isPlaying: Boolean = false,
+    val isReady: Boolean = false,
+    val currentSentenceIndex: Int = 0,
+    val sentenceCount: Int = 0,
+    val estimatedTimeRemainingMs: Long = 0L,
+    val sentenceHighlight: TextRange? = null,
+    val wordHighlight: TextRange? = null,
+    val currentSpeaker: SpeakerChipInfo? = null,
+    val missingVoiceWarning: String? = null
+)
+
+/**
+ * Individual sentence token with character offsets into the chapter text and segment.
+ */
+data class Sentence(
+    val index: Int,
+    val segmentId: String,
+    val segmentType: SegmentType,
+    val text: String,
+    val sentenceStartInChapter: Int,
+    val sentenceEndInChapter: Int,
+    val sentenceStartInSegment: Int,
+    val sentenceEndInSegment: Int,
+    val initialSpeakerId: String
+)
+
+/**
+ * High-performance playback controller coordinating sentence lookahead queueing,
+ * dynamic voice attribution, sentence/word highlights, and seamless multi-voice synthesis.
  */
 class PlaybackController(
     private val speechEngine: SpeechEngine,
-    private val scope: CoroutineScope = CoroutineScope(Dispatchers.Main.immediate)
+    private val scope: CoroutineScope = CoroutineScope(Dispatchers.Main.immediate),
+    private val bookLocale: String = "en-US",
+    private val lookaheadCount: Int = DEFAULT_LOOKAHEAD_COUNT
 ) {
+    private val _readerState = MutableStateFlow(ReaderState())
+    val readerState: StateFlow<ReaderState> = _readerState.asStateFlow()
+
+    // Backwards-compatible legacy state flow
     private val _state = MutableStateFlow<PlaybackState>(PlaybackState.Idle)
     val state: StateFlow<PlaybackState> = _state.asStateFlow()
 
     private var segments: List<Segment> = emptyList()
-    private var characters: Map<String, Character> = mapOf(Character.NARRATOR_ID to Character.Narrator)
+    private var sentences: List<Sentence> = emptyList()
+
+    private var characters: Map<String, Character> = mapOf(
+        Character.NARRATOR_ID to Character.Narrator,
+        Character.UNNAMED_ID to Character.Unnamed
+    )
+    private var availableVoices: List<VoiceInfo> = emptyList()
     private var globalSpeed: Float? = null
 
-    private var currentSegmentIndex: Int = 0
-    private var activeUtteranceId: String? = null
-    private var currentRangeInSegment: TextRange? = null
+    private var currentSentenceIndex: Int = 0
+    private var lastEnqueuedIndex: Int = -1
+    private var playRequestedWhenReady: Boolean = false
 
     private var eventCollectorJob: Job? = null
+    private var readyCollectorJob: Job? = null
 
     init {
-        startListeningToSpeechEvents()
+        availableVoices = speechEngine.getAvailableVoices()
+        startListeningToEngine()
     }
 
-    private fun startListeningToSpeechEvents() {
+    private fun startListeningToEngine() {
+        readyCollectorJob?.cancel()
+        readyCollectorJob = scope.launch {
+            speechEngine.isReady.collect { ready ->
+                _readerState.value = _readerState.value.copy(isReady = ready)
+                if (ready && playRequestedWhenReady) {
+                    playRequestedWhenReady = false
+                    startPlayingFromCurrent()
+                }
+            }
+        }
+
         eventCollectorJob?.cancel()
         eventCollectorJob = scope.launch {
             speechEngine.events.collect { event ->
@@ -52,95 +117,105 @@ class PlaybackController(
     }
 
     /**
-     * Loads a new sequence of chapter segments.
-     *
-     * @param newSegments The segmented chapter content.
-     * @param initialIndex The starting segment index (defaults to 0 or first non-blank segment).
+     * Loads chapter segments, splits them into sentences, and prepares the reader.
+     * Blank or whitespace-only segments and sentences are automatically skipped.
      */
-    fun loadSegments(newSegments: List<Segment>, initialIndex: Int = 0) {
+    fun loadSegments(newSegments: List<Segment>, initialSentenceIndex: Int = 0) {
         speechEngine.stop()
         segments = newSegments
-        activeUtteranceId = null
-        currentRangeInSegment = null
+        sentences = splitSegmentsIntoSentences(newSegments)
 
-        val firstNonBlank = findNextNonBlankIndex(initialIndex.coerceAtLeast(0))
-        currentSegmentIndex = firstNonBlank ?: 0
-        _state.value = if (firstNonBlank != null) PlaybackState.Idle else PlaybackState.Stopped
+        currentSentenceIndex = initialSentenceIndex.coerceIn(0, (sentences.size - 1).coerceAtLeast(0))
+        lastEnqueuedIndex = currentSentenceIndex - 1
+        playRequestedWhenReady = false
+
+        updateReaderState(isPlaying = false)
+        _state.value = if (sentences.isNotEmpty()) PlaybackState.Idle else PlaybackState.Stopped
     }
 
     /**
-     * Updates character definitions used for voice, pitch, and speed lookup.
+     * Updates character definitions. Settings take effect from the next enqueued sentence
+     * without flushing the existing queue.
      */
     fun updateCharacters(characterList: List<Character>) {
         val map = characterList.associateBy { it.id }.toMutableMap()
         if (!map.containsKey(Character.NARRATOR_ID)) {
             map[Character.NARRATOR_ID] = Character.Narrator
         }
+        if (!map.containsKey(Character.UNNAMED_ID)) {
+            map[Character.UNNAMED_ID] = Character.Unnamed
+        }
         characters = map
     }
 
     /**
-     * Sets a global playback speed multiplier. If null, per-character speed is used.
+     * Sets available voices for voice selection.
+     */
+    fun updateAvailableVoices(voices: List<VoiceInfo>) {
+        availableVoices = voices
+    }
+
+    /**
+     * Sets a global playback speed multiplier. Applied from the next enqueued sentence
+     * without flushing the queue.
      */
     fun setGlobalSpeed(speed: Float?) {
         globalSpeed = speed
-        // If currently playing, restart segment with new speed
-        if (_state.value is PlaybackState.Playing) {
-            speakCurrentSegment()
-        }
     }
 
     /**
-     * Begins or resumes playback.
+     * Begins or resumes playback. If engine is not yet ready, queues play request.
      */
     fun play() {
-        if (segments.isEmpty()) return
+        if (sentences.isEmpty()) return
 
-        when (val s = _state.value) {
-            is PlaybackState.Playing -> return
-            is PlaybackState.Paused -> resume()
-            is PlaybackState.Idle, is PlaybackState.Stopped, is PlaybackState.Error, is PlaybackState.Buffering -> {
-                val nonBlank = findNextNonBlankIndex(currentSegmentIndex)
-                if (nonBlank != null) {
-                    currentSegmentIndex = nonBlank
-                    speakCurrentSegment()
-                } else {
-                    _state.value = PlaybackState.Stopped
-                }
-            }
+        if (!speechEngine.isReady.value) {
+            playRequestedWhenReady = true
+            return
         }
+
+        if (_readerState.value.isPlaying) return
+
+        startPlayingFromCurrent()
+    }
+
+    private fun startPlayingFromCurrent() {
+        if (sentences.isEmpty()) return
+
+        lastEnqueuedIndex = currentSentenceIndex - 1
+        updateReaderState(isPlaying = true)
+        _state.value = PlaybackState.Playing(getSegmentIndexForSentence(currentSentenceIndex), null)
+
+        refillQueue()
     }
 
     /**
-     * Pauses playback.
+     * Pauses playback. Stops the engine and remembers current sentence index.
+     * Resume will restart from the beginning of this sentence.
      */
     fun pause() {
-        when (_state.value) {
-            is PlaybackState.Playing, is PlaybackState.Buffering -> {
-                speechEngine.pause()
-                _state.value = PlaybackState.Paused(currentSegmentIndex, currentRangeInSegment)
-            }
-            else -> {}
-        }
+        if (!_readerState.value.isPlaying && !playRequestedWhenReady) return
+
+        playRequestedWhenReady = false
+        speechEngine.stop()
+        lastEnqueuedIndex = currentSentenceIndex - 1
+
+        updateReaderState(isPlaying = false, clearWordHighlight = true)
+        _state.value = PlaybackState.Paused(getSegmentIndexForSentence(currentSentenceIndex), null)
     }
 
     /**
-     * Resumes playback if currently paused.
+     * Resumes playback from the beginning of the remembered sentence.
      */
     fun resume() {
-        if (_state.value is PlaybackState.Paused) {
-            speechEngine.resume()
-            _state.value = PlaybackState.Playing(currentSegmentIndex, currentRangeInSegment)
-        } else {
-            play()
-        }
+        play()
     }
 
     /**
      * Toggles between play and pause.
      */
     fun togglePlayPause() {
-        if (_state.value.isPlaying) {
+        if (_readerState.value.isPlaying) {
             pause()
         } else {
             play()
@@ -148,175 +223,303 @@ class PlaybackController(
     }
 
     /**
-     * Stops playback and resets state.
+     * Stops playback and resets highlights.
      */
     fun stop() {
-        activeUtteranceId = null
-        currentRangeInSegment = null
+        playRequestedWhenReady = false
         speechEngine.stop()
+        lastEnqueuedIndex = currentSentenceIndex - 1
+
+        updateReaderState(isPlaying = false, clearSentenceHighlight = true, clearWordHighlight = true)
         _state.value = PlaybackState.Stopped
     }
 
     /**
-     * Jumps to the next non-blank segment.
+     * Jumps to the next sentence without extra delay.
      */
     fun next() {
-        val nextIdx = findNextNonBlankIndex(currentSegmentIndex + 1)
-        if (nextIdx != null) {
-            currentSegmentIndex = nextIdx
-            if (_state.value.isPlaying || _state.value is PlaybackState.Buffering) {
-                speakCurrentSegment()
-            } else {
-                _state.value = PlaybackState.Paused(currentSegmentIndex, null)
-            }
-        } else {
-            stop()
-        }
+        jumpToSentence(currentSentenceIndex + 1)
     }
 
     /**
-     * Jumps to the previous non-blank segment.
+     * Jumps to the previous sentence without extra delay.
      */
     fun previous() {
-        val prevIdx = findPreviousNonBlankIndex(currentSegmentIndex - 1)
-        if (prevIdx != null) {
-            currentSegmentIndex = prevIdx
-            if (_state.value.isPlaying || _state.value is PlaybackState.Buffering) {
-                speakCurrentSegment()
-            } else {
-                _state.value = PlaybackState.Paused(currentSegmentIndex, null)
-            }
+        jumpToSentence(currentSentenceIndex - 1)
+    }
+
+    /**
+     * Seeks to a specific sentence index. Stops audio, updates index, and speaks immediately if playing.
+     */
+    fun jumpToSentence(targetIndex: Int) {
+        if (sentences.isEmpty()) return
+
+        val boundedIndex = targetIndex.coerceIn(0, sentences.size - 1)
+        val wasPlaying = _readerState.value.isPlaying || playRequestedWhenReady
+
+        speechEngine.stop()
+        currentSentenceIndex = boundedIndex
+        lastEnqueuedIndex = currentSentenceIndex - 1
+
+        if (wasPlaying) {
+            startPlayingFromCurrent()
+        } else {
+            updateReaderState(isPlaying = false, clearWordHighlight = true)
+            _state.value = PlaybackState.Paused(getSegmentIndexForSentence(currentSentenceIndex), null)
         }
     }
 
     /**
-     * Seeks to a specific segment index, automatically adjusting to the nearest non-blank segment.
+     * Backwards-compatible seek to segment index.
      */
-    fun seekTo(index: Int) {
-        val bounded = index.coerceIn(0, (segments.size - 1).coerceAtLeast(0))
-        val targetIndex = if (isSegmentBlank(bounded)) {
-            findNextNonBlankIndex(bounded) ?: findPreviousNonBlankIndex(bounded) ?: bounded
-        } else {
-            bounded
-        }
-
-        currentSegmentIndex = targetIndex
-        currentRangeInSegment = null
-
-        if (_state.value.isPlaying) {
-            speakCurrentSegment()
-        } else {
-            _state.value = PlaybackState.Paused(currentSegmentIndex, null)
+    fun seekTo(segmentIndex: Int) {
+        val targetSentence = sentences.firstOrNull { it.segmentId == segments.getOrNull(segmentIndex)?.id }
+        if (targetSentence != null) {
+            jumpToSentence(targetSentence.index)
         }
     }
 
-    private fun speakCurrentSegment() {
-        if (currentSegmentIndex !in segments.indices) {
-            _state.value = PlaybackState.Stopped
-            return
-        }
-
-        val segment = segments[currentSegmentIndex]
-        if (segment.text.isBlank()) {
-            // Automatically skip blank or whitespace-only segments
-            val nextIdx = findNextNonBlankIndex(currentSegmentIndex + 1)
-            if (nextIdx != null) {
-                currentSegmentIndex = nextIdx
-                speakCurrentSegment()
+    /**
+     * Reassigns a speaker for a segment.
+     * Only reassigning the currently playing line flushes the engine queue and restarts
+     * from that segment. Other edits apply without flushing.
+     */
+    fun reassignSpeaker(segmentId: String, newSpeakerId: String, isOverride: Boolean = true) {
+        // Update segment in memory
+        segments = segments.map { seg ->
+            if (seg.id == segmentId) {
+                if (isOverride) seg.copy(speakerOverride = newSpeakerId) else seg.copy(speakerId = newSpeakerId)
             } else {
-                _state.value = PlaybackState.Stopped
+                seg
             }
-            return
         }
 
-        val speaker = characters[segment.effectiveSpeakerId] ?: Character.Narrator
+        val currentlyPlayingSentence = sentences.getOrNull(currentSentenceIndex)
+        val isCurrentlyPlaying = currentlyPlayingSentence?.segmentId == segmentId
+
+        if (isCurrentlyPlaying && _readerState.value.isPlaying) {
+            // Flush queue and restart from this sentence with new voice
+            speechEngine.stop()
+            lastEnqueuedIndex = currentSentenceIndex - 1
+            refillQueue()
+        }
+    }
+
+    /**
+     * Maintains lookahead queue: always keeps at least [lookaheadCount] sentences enqueued ahead.
+     */
+    private fun refillQueue() {
+        if (!_readerState.value.isPlaying || sentences.isEmpty()) return
+
+        val targetMaxIndex = minOf(sentences.size - 1, currentSentenceIndex + lookaheadCount)
+        while (lastEnqueuedIndex < targetMaxIndex) {
+            val nextIndexToEnqueue = lastEnqueuedIndex + 1
+            enqueueSentence(sentences[nextIndexToEnqueue])
+            lastEnqueuedIndex = nextIndexToEnqueue
+        }
+    }
+
+    private fun enqueueSentence(sentence: Sentence) {
+        val segment = segments.firstOrNull { it.id == sentence.segmentId }
+        val speakerId = segment?.effectiveSpeakerId ?: sentence.initialSpeakerId
+        val speaker = characters[speakerId] ?: characters[Character.UNNAMED_ID] ?: Character.Narrator
+
+        // Select voice using VoiceSelector rules
+        val usedVoiceIds = characters.values.mapNotNull { it.voiceId }.toSet()
+        val narratorVoiceId = characters[Character.NARRATOR_ID]?.voiceId
+        val voiceResult = VoiceSelector.pick(
+            character = speaker,
+            availableVoices = availableVoices,
+            usedVoices = usedVoiceIds,
+            bookLocale = bookLocale,
+            narratorVoiceId = narratorVoiceId
+        )
+
+        if (voiceResult.missingVoiceWarning != null) {
+            _readerState.value = _readerState.value.copy(missingVoiceWarning = voiceResult.missingVoiceWarning)
+        }
+
+        // Settings come only from getSettings(character)
         val settings = VoiceSettings.getSettings(speaker, globalSpeed)
-
-        val utteranceId = "utt_${segment.id}_${System.currentTimeMillis()}"
-        activeUtteranceId = utteranceId
-        currentRangeInSegment = null
-
-        _state.value = PlaybackState.Buffering(currentSegmentIndex)
-
-        // Pre-warm the next non-blank segment's voice
-        val nextIdx = findNextNonBlankIndex(currentSegmentIndex + 1)
-        if (nextIdx != null && nextIdx in segments.indices) {
-            val nextSegment = segments[nextIdx]
-            val nextSpeaker = characters[nextSegment.effectiveSpeakerId] ?: Character.Narrator
-            speechEngine.prewarm(nextSpeaker.voiceId)
-        }
+        val utteranceId = makeUtteranceId(sentence.index, sentence.segmentId)
 
         speechEngine.speak(
-            utteranceId = utteranceId,
-            text = segment.text,
-            voiceId = speaker.voiceId,
-            speed = settings.speed,
-            pitch = settings.pitch
+            sentence = sentence.text,
+            voice = voiceResult.voice,
+            settings = settings,
+            utteranceId = utteranceId
         )
     }
 
     private fun handleSpeechEvent(event: SpeechEvent) {
         when (event) {
             is SpeechEvent.Started -> {
-                if (event.utteranceId == activeUtteranceId) {
-                    _state.value = PlaybackState.Playing(currentSegmentIndex, currentRangeInSegment)
+                val sentenceIndex = parseSentenceIndex(event.utteranceId) ?: return
+                currentSentenceIndex = sentenceIndex
+
+                val sentence = sentences.getOrNull(sentenceIndex)
+                val speakerChip = sentence?.let {
+                    val speakerId = segments.firstOrNull { seg -> seg.id == it.segmentId }?.effectiveSpeakerId ?: it.initialSpeakerId
+                    val char = characters[speakerId] ?: characters[Character.UNNAMED_ID] ?: Character.Narrator
+                    SpeakerChipInfo(id = char.id, displayName = char.name)
                 }
+
+                updateReaderState(
+                    isPlaying = true,
+                    sentenceHighlight = sentence?.let { TextRange(it.sentenceStartInChapter, it.sentenceEndInChapter) },
+                    currentSpeaker = speakerChip,
+                    clearWordHighlight = true
+                )
+
+                _state.value = PlaybackState.Playing(
+                    segmentIndex = getSegmentIndexForSentence(sentenceIndex),
+                    rangeInSegment = sentence?.let { TextRange(it.sentenceStartInSegment, it.sentenceEndInSegment) }
+                )
+
+                // Refill queue on onStart of earlier utterances
+                refillQueue()
             }
-            is SpeechEvent.RangeStarted -> {
-                if (event.utteranceId == activeUtteranceId) {
-                    val range = TextRange(event.startOffset, event.endOffset)
-                    currentRangeInSegment = range
-                    _state.value = PlaybackState.Playing(currentSegmentIndex, range)
-                }
-            }
-            is SpeechEvent.Done -> {
-                if (event.utteranceId == activeUtteranceId) {
-                    // Auto-advance to the next non-blank segment
-                    val nextIdx = findNextNonBlankIndex(currentSegmentIndex + 1)
-                    if (nextIdx != null) {
-                        currentSegmentIndex = nextIdx
-                        speakCurrentSegment()
-                    } else {
-                        activeUtteranceId = null
-                        currentRangeInSegment = null
-                        _state.value = PlaybackState.Stopped
-                    }
-                }
-            }
-            is SpeechEvent.Error -> {
-                if (event.utteranceId == activeUtteranceId) {
-                    activeUtteranceId = null
-                    currentRangeInSegment = null
-                    _state.value = PlaybackState.Error(
-                        message = "Speech synthesis error [${event.errorCode}]: ${event.message}"
+
+            is SpeechEvent.Range -> {
+                val sentenceIndex = parseSentenceIndex(event.utteranceId) ?: currentSentenceIndex
+                val sentence = sentences.getOrNull(sentenceIndex)
+                if (sentence != null) {
+                    val wordRangeInChapter = TextRange(
+                        startOffset = sentence.sentenceStartInChapter + event.start,
+                        endOffset = sentence.sentenceStartInChapter + event.end
+                    )
+                    _readerState.value = _readerState.value.copy(wordHighlight = wordRangeInChapter)
+
+                    val wordRangeInSegment = TextRange(
+                        startOffset = sentence.sentenceStartInSegment + event.start,
+                        endOffset = sentence.sentenceStartInSegment + event.end
+                    )
+                    _state.value = PlaybackState.Playing(
+                        segmentIndex = getSegmentIndexForSentence(sentenceIndex),
+                        rangeInSegment = wordRangeInSegment
                     )
                 }
             }
+
+            is SpeechEvent.Done -> {
+                val doneIndex = parseSentenceIndex(event.utteranceId)
+                if (doneIndex != null && doneIndex == sentences.size - 1) {
+                    // Reached end of chapter
+                    updateReaderState(isPlaying = false, clearSentenceHighlight = true, clearWordHighlight = true)
+                    _state.value = PlaybackState.Stopped
+                } else {
+                    // Refill queue on onDone of earlier utterances
+                    refillQueue()
+                }
+            }
+
+            is SpeechEvent.Error -> {
+                _readerState.value = _readerState.value.copy(
+                    isPlaying = false,
+                    missingVoiceWarning = "Speech synthesis error [${event.errorCode}]: ${event.message}"
+                )
+                _state.value = PlaybackState.Error(
+                    message = "Speech error: ${event.message}"
+                )
+            }
         }
     }
 
-    private fun isSegmentBlank(index: Int): Boolean {
-        if (index !in segments.indices) return true
-        return segments[index].text.isBlank()
-    }
-
-    private fun findNextNonBlankIndex(fromIndex: Int): Int? {
-        for (i in fromIndex until segments.size) {
-            if (segments[i].text.isNotBlank()) return i
+    private fun updateReaderState(
+        isPlaying: Boolean,
+        sentenceHighlight: TextRange? = null,
+        currentSpeaker: SpeakerChipInfo? = null,
+        clearSentenceHighlight: Boolean = false,
+        clearWordHighlight: Boolean = false
+    ) {
+        val currentSentence = sentences.getOrNull(currentSentenceIndex)
+        val activeSpeaker = currentSpeaker ?: currentSentence?.let {
+            val speakerId = segments.firstOrNull { seg -> seg.id == it.segmentId }?.effectiveSpeakerId ?: it.initialSpeakerId
+            val char = characters[speakerId] ?: characters[Character.UNNAMED_ID] ?: Character.Narrator
+            SpeakerChipInfo(char.id, char.name)
         }
-        return null
+
+        val remainingWords = sentences.drop(currentSentenceIndex).sumOf { it.text.split(Regex("\\s+")).size }
+        val speedMultiplier = globalSpeed ?: 1.0f
+        val wordsPerMinute = 150.0f * speedMultiplier
+        val estimatedMs = if (wordsPerMinute > 0) ((remainingWords / wordsPerMinute) * 60000).toLong() else 0L
+
+        _readerState.value = _readerState.value.copy(
+            isPlaying = isPlaying,
+            currentSentenceIndex = currentSentenceIndex,
+            sentenceCount = sentences.size,
+            estimatedTimeRemainingMs = estimatedMs,
+            sentenceHighlight = if (clearSentenceHighlight) null else (sentenceHighlight ?: _readerState.value.sentenceHighlight),
+            wordHighlight = if (clearWordHighlight) null else _readerState.value.wordHighlight,
+            currentSpeaker = activeSpeaker
+        )
     }
 
-    private fun findPreviousNonBlankIndex(fromIndex: Int): Int? {
-        for (i in fromIndex downTo 0) {
-            if (i in segments.indices && segments[i].text.isNotBlank()) return i
+    private fun getSegmentIndexForSentence(sentenceIndex: Int): Int {
+        val s = sentences.getOrNull(sentenceIndex) ?: return 0
+        val idx = segments.indexOfFirst { it.id == s.segmentId }
+        return if (idx >= 0) idx else 0
+    }
+
+    private fun splitSegmentsIntoSentences(segmentsList: List<Segment>): List<Sentence> {
+        val result = mutableListOf<Sentence>()
+        var globalIndex = 0
+
+        val sentenceBoundaryRegex = Regex("""[^.!?…\n]+(?:[.!?…]+["'”’»]?|\n+|$)""")
+
+        for (segment in segmentsList) {
+            val text = segment.text
+            if (text.isBlank()) continue
+
+            val matches = sentenceBoundaryRegex.findAll(text)
+            for (match in matches) {
+                val raw = match.value
+                val trimmed = raw.trim()
+                if (trimmed.isNotEmpty()) {
+                    val leadingWhitespace = raw.indexOf(trimmed)
+                    val startInSeg = match.range.first + leadingWhitespace
+                    val endInSeg = startInSeg + trimmed.length
+
+                    result.add(
+                        Sentence(
+                            index = globalIndex,
+                            segmentId = segment.id,
+                            segmentType = segment.type,
+                            text = trimmed,
+                            sentenceStartInChapter = segment.startOffset + startInSeg,
+                            sentenceEndInChapter = segment.startOffset + endInSeg,
+                            sentenceStartInSegment = startInSeg,
+                            sentenceEndInSegment = endInSeg,
+                            initialSpeakerId = segment.effectiveSpeakerId
+                        )
+                    )
+                    globalIndex++
+                }
+            }
+        }
+        return result
+    }
+
+    private fun makeUtteranceId(index: Int, segmentId: String): String {
+        return "utt_${index}_${segmentId}_${System.nanoTime()}"
+    }
+
+    private fun parseSentenceIndex(utteranceId: String): Int? {
+        val parts = utteranceId.split("_")
+        if (parts.size >= 2 && parts[0] == "utt") {
+            return parts[1].toIntOrNull()
         }
         return null
     }
 
     fun release() {
         stop()
+        readyCollectorJob?.cancel()
         eventCollectorJob?.cancel()
-        speechEngine.shutdown()
+        speechEngine.release()
+    }
+
+    companion object {
+        const val DEFAULT_LOOKAHEAD_COUNT = 3
     }
 }

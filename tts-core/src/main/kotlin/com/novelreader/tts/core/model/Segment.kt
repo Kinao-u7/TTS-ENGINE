@@ -8,7 +8,7 @@ package com.novelreader.tts.core.model
  * @property text The exact substring from the source text.
  * @property startOffset 0-based character offset into the original text (inclusive).
  * @property endOffset 0-based character offset into the original text (exclusive).
- * @property speakerId Character ID resolved by automated attribution (unused for now).
+ * @property speakerId Character ID resolved by automated attribution or character mapping.
  * @property speakerOverride Character ID explicitly chosen by the user.
  */
 data class Segment(
@@ -22,10 +22,14 @@ data class Segment(
 ) {
     /**
      * Effective speaker resolution rule:
-     * speakerOverride ?: speakerId ?: Character.NARRATOR_ID
+     * speakerOverride ?: speakerId ?: (DIALOGUE -> "unnamed", NARRATION -> "narrator")
      */
     val effectiveSpeakerId: String
-        get() = speakerOverride ?: speakerId ?: Character.NARRATOR_ID
+        get() = speakerOverride ?: speakerId ?: if (type == SegmentType.DIALOGUE) {
+            Character.UNNAMED_ID
+        } else {
+            Character.NARRATOR_ID
+        }
 
     init {
         require(startOffset >= 0) { "startOffset must be >= 0: $startOffset" }

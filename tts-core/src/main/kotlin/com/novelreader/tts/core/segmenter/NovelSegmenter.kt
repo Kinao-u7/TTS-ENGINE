@@ -12,14 +12,14 @@ import com.novelreader.tts.core.model.SegmentType
  * - Straight double quotes ("...")
  * - Curly double quotes (“...”)
  * - French angle quotes / guillemets («...»)
- * - Single quotes ('...' and ‘...’) when [SegmenterOptions.enableSingleQuotes] is true (disabled by default)
+ * - Single quotes ('...' and ‘...’) when [SegmenterOptions.singleQuoteDialogue] is true (disabled by default)
  * - Contractions and apostrophes inside quotes (e.g. don't, it's, Xian's)
  * - Quotes on their own lines
  * - Narration followed by dialogue on a subsequent line
  * - Multi-paragraph quotes where an opening quote is not closed before a new paragraph begins with a quote
  * - Unclosed quotes (gracefully terminated at the end of the paragraph or input)
- * - Stable segment IDs based on dialogue/narration index and a short text hash
- * - All segments default to the narrator voice.
+ * - Stable segment IDs: "<dialogueIndexInChapter>-<short hash of segment text>", never raw offsets
+ * - Effective speaker defaults to "narrator" for narration and "unnamed" for dialogue.
  */
 object NovelSegmenter {
 
@@ -122,9 +122,13 @@ object NovelSegmenter {
         index: Int,
         text: String
     ): String {
-        val typeCode = if (type == SegmentType.DIALOGUE) "d" else "n"
         val hash = computeShortHash(text)
-        return "${prefix}_${typeCode}${index}_$hash"
+        val baseId = if (type == SegmentType.DIALOGUE) {
+            "$index-$hash"
+        } else {
+            "n$index-$hash"
+        }
+        return if (prefix.isNotBlank()) "${prefix}_$baseId" else baseId
     }
 
     private fun findDialogueSpans(text: String, options: SegmenterOptions): List<DialogueSpan> {
@@ -150,7 +154,7 @@ object NovelSegmenter {
         val ch = text[index]
         return when (ch) {
             '"', '“', '«' -> true
-            '\'', '‘' -> options.enableSingleQuotes && isSingleQuoteOpening(text, index)
+            '\'', '‘' -> options.effectiveSingleQuoteDialogue && isSingleQuoteOpening(text, index)
             else -> false
         }
     }

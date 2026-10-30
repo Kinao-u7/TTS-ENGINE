@@ -1,6 +1,8 @@
 package com.novelreader.tts.core.engine
 
+import com.novelreader.tts.core.model.VoiceGender
 import com.novelreader.tts.core.model.VoiceInfo
+import com.novelreader.tts.core.model.VoiceSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -12,68 +14,86 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 /**
- * In-memory test implementation of [SpeechEngine] with controllable delays, event emission,
- * and call inspection.
+ * In-memory test implementation of [SpeechEngine] with controllable readiness, event emission,
+ * and call inspection for kotlinx-coroutines-test.
  */
 class FakeSpeechEngine(
-    initialState: EngineState = EngineState.Ready,
+    initialReady: Boolean = true,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.Unconfined),
     var autoCompleteOnSpeak: Boolean = false
 ) : SpeechEngine {
 
     data class SpeakRecord(
         val utteranceId: String,
-        val text: String,
-        val voiceId: String?,
-        val speed: Float,
-        val pitch: Float
+        val sentence: String,
+        val voice: VoiceInfo?,
+        val settings: VoiceSettings
     )
 
-    private val _engineState = MutableStateFlow(initialState)
-    override val engineState: StateFlow<EngineState> = _engineState.asStateFlow()
+    private val _isReady = MutableStateFlow(initialReady)
+    override val isReady: StateFlow<Boolean> = _isReady.asStateFlow()
 
     private val _events = MutableSharedFlow<SpeechEvent>(extraBufferCapacity = 64)
     override val events: SharedFlow<SpeechEvent> = _events.asSharedFlow()
 
     val speakRecords = mutableListOf<SpeakRecord>()
-    val prewarmedVoices = mutableListOf<String?>()
+    val queuedSpeaksBeforeReady = mutableListOf<SpeakRecord>()
+    val warmedUpVoices = mutableListOf<VoiceInfo?>()
     var stopCount = 0
-    var pauseCount = 0
-    var resumeCount = 0
-    var lastUtteranceId: String? = null
+    var releaseCount = 0
+    var warmUpCount = 0
 
     var mockVoices: List<VoiceInfo> = listOf(
-        VoiceInfo("voice_en_1", "English (United States) - Male 1", "en-US"),
-        VoiceInfo("voice_en_2", "English (United States) - Female 1", "en-US"),
-        VoiceInfo("voice_en_3", "English (United Kingdom) - Male 1", "en-GB")
+        VoiceInfo("voice_en_narrator", "English Narrator", "en-US", VoiceGender.ANY),
+        VoiceInfo("voice_en_m1", "English Male 1", "en-US", VoiceGender.MALE),
+        VoiceInfo("voice_en_f1", "English Female 1", "en-US", VoiceGender.FEMALE),
+        VoiceInfo("voice_gb_m1", "British Male 1", "en-GB", VoiceGender.MALE),
+        VoiceInfo("voice_gb_f1", "British Female 1", "en-GB", VoiceGender.FEMALE),
+        VoiceInfo("voice_net_f1", "Network Female", "en-US", VoiceGender.FEMALE, requiresNetwork = true)
     )
 
-    fun setState(newState: EngineState) {
-        _engineState.value = newState
+    fun setReady(ready: Boolean) {
+        _isReady.value = ready
+        if (ready && queuedSpeaksBeforeReady.isNotEmpty()) {
+            val toDrain = queuedSpeaksBeforeReady.toList()
+            queuedSpeaksBeforeReady.clear()
+            for (item in toDrain) {
+                speak(item.sentence, item.voice, item.settings, item.utteranceId)
+            }
+        }
     }
 
     override fun speak(
-        utteranceId: String,
-        text: String,
-        voiceId: String?,
-        speed: Float,
-        pitch: Float
+        sentence: String,
+        voice: VoiceInfo?,
+        settings: VoiceSettings,
+        utteranceId: String
     ) {
-        val record = SpeakRecord(utteranceId, text, voiceId, speed, pitch)
-        speakRecords.add(record)
-        lastUtteranceId = utteranceId
+        val record = SpeakRecord(utteranceId, sentence, voice, settings)
+        if (!_isReady.value) {
+            queuedSpeaksBeforeReady.add(record)
+            return
+        }
 
-        scope.launch {
-            _events.emit(SpeechEvent.Started(utteranceId))
-            if (autoCompleteOnSpeak) {
+        speakRecords.add(record)
+
+        if (autoCompleteOnSpeak) {
+            scope.launch {
+                _events.emit(SpeechEvent.Started(utteranceId))
                 _events.emit(SpeechEvent.Done(utteranceId))
             }
         }
     }
 
-    fun emitRangeStart(utteranceId: String, startOffset: Int, endOffset: Int) {
+    fun emitStarted(utteranceId: String) {
         scope.launch {
-            _events.emit(SpeechEvent.RangeStarted(utteranceId, startOffset, endOffset))
+            _events.emit(SpeechEvent.Started(utteranceId))
+        }
+    }
+
+    fun emitRange(start: Int, end: Int, utteranceId: String) {
+        scope.launch {
+            _events.emit(SpeechEvent.Range(start = start, end = end, utteranceId = utteranceId))
         }
     }
 
@@ -85,7 +105,7 @@ class FakeSpeechEngine(
 
     fun emitError(utteranceId: String, message: String, errorCode: Int = -1) {
         scope.launch {
-            _events.emit(SpeechEvent.Error(utteranceId, message, errorCode))
+            _events.emit(SpeechEvent.Error(utteranceId = utteranceId, message = message, errorCode = errorCode))
         }
     }
 
@@ -93,22 +113,15 @@ class FakeSpeechEngine(
         stopCount++
     }
 
-    override fun pause() {
-        pauseCount++
+    override fun warmUp(voice: VoiceInfo?) {
+        warmUpCount++
+        warmedUpVoices.add(voice)
     }
 
-    override fun resume() {
-        resumeCount++
+    override fun release() {
+        releaseCount++
+        _isReady.value = false
     }
 
     override fun getAvailableVoices(): List<VoiceInfo> = mockVoices
-
-    override fun prewarm(voiceId: String?) {
-        prewarmedVoices.add(voiceId)
-    }
-
-    override fun shutdown() {
-        stop()
-        _engineState.value = EngineState.Uninitialized
-    }
 }

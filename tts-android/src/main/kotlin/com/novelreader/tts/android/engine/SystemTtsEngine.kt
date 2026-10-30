@@ -1,7 +1,6 @@
 package com.novelreader.tts.android.engine
 
 import android.content.Context
-import android.os.Build
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
@@ -9,7 +8,9 @@ import android.speech.tts.Voice
 import com.novelreader.tts.core.engine.EngineState
 import com.novelreader.tts.core.engine.SpeechEngine
 import com.novelreader.tts.core.engine.SpeechEvent
+import com.novelreader.tts.core.model.VoiceGender
 import com.novelreader.tts.core.model.VoiceInfo
+import com.novelreader.tts.core.model.VoiceSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -20,43 +21,71 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.util.Locale
+import java.util.concurrent.ConcurrentLinkedQueue
 
 /**
- * Android platform implementation of [SpeechEngine] backed by [TextToSpeech].
+ * Android platform implementation of [SpeechEngine] backed by system [TextToSpeech].
+ *
+ * - Initializes TextToSpeech eagerly when created.
+ * - Exposes isReady StateFlow.
+ * - Speaks a silent warm-up utterance upon initialization.
+ * - Queues any speak requests made before ready and drains them once ready.
+ * - Applies setVoice, setPitch, setSpeechRate right before each speak(..., QUEUE_ADD, ...).
+ * - Implements UtteranceProgressListener.onRangeStart for word ranges.
+ * - Only shuts down on release().
+ * - Optional gapMs setting for speaker changes and paragraph breaks.
  */
 class SystemTtsEngine(
     context: Context,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default),
-    targetEnginePackage: String? = null
+    val targetEnginePackage: String? = null,
+    var gapMs: Long = 0L
 ) : SpeechEngine {
+
+    private data class QueuedSpeak(
+        val sentence: String,
+        val voice: VoiceInfo?,
+        val settings: VoiceSettings,
+        val utteranceId: String,
+        val isSpeakerChange: Boolean
+    )
+
+    private val _isReady = MutableStateFlow(false)
+    override val isReady: StateFlow<Boolean> = _isReady.asStateFlow()
 
     private val _engineState = MutableStateFlow<EngineState>(EngineState.Uninitialized)
     override val engineState: StateFlow<EngineState> = _engineState.asStateFlow()
 
-    private val _events = MutableSharedFlow<SpeechEvent>(extraBufferCapacity = 64)
+    private val _events = MutableSharedFlow<SpeechEvent>(extraBufferCapacity = 128)
     override val events: SharedFlow<SpeechEvent> = _events.asSharedFlow()
 
     private val appContext = context.applicationContext
     private var textToSpeech: TextToSpeech? = null
 
-    private var activeUtteranceId: String? = null
-    private var pausedText: String? = null
-    private var pausedVoiceId: String? = null
-    private var pausedSpeed: Float = 1.0f
-    private var pausedPitch: Float = 1.0f
+    private val pendingQueue = ConcurrentLinkedQueue<QueuedSpeak>()
+    private var lastSpokenVoiceId: String? = null
 
     init {
-        initializeTts(targetEnginePackage)
+        initializeTtsEagerly(targetEnginePackage)
     }
 
-    private fun initializeTts(enginePackage: String?) {
+    private fun initializeTtsEagerly(enginePackage: String?) {
         _engineState.value = EngineState.Initializing
 
         textToSpeech = TextToSpeech(appContext, { status ->
             if (status == TextToSpeech.SUCCESS) {
                 configureProgressListener()
                 _engineState.value = EngineState.Ready
+
+                // Speak silent warm-up utterance upon init success
+                warmUp()
+
+                _isReady.value = true
+
+                // Drain queued requests
+                drainPendingQueue()
             } else {
+                _isReady.value = false
                 _engineState.value = EngineState.Error("TextToSpeech initialization failed with status $status")
             }
         }, enginePackage)
@@ -65,17 +94,17 @@ class SystemTtsEngine(
     private fun configureProgressListener() {
         textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
-                utteranceId?.let { id ->
+                if (utteranceId != null && !utteranceId.startsWith("warmup_") && !utteranceId.startsWith("gap_")) {
                     scope.launch {
-                        _events.emit(SpeechEvent.Started(id))
+                        _events.emit(SpeechEvent.Started(utteranceId))
                     }
                 }
             }
 
             override fun onDone(utteranceId: String?) {
-                utteranceId?.let { id ->
+                if (utteranceId != null && !utteranceId.startsWith("warmup_") && !utteranceId.startsWith("gap_")) {
                     scope.launch {
-                        _events.emit(SpeechEvent.Done(id))
+                        _events.emit(SpeechEvent.Done(utteranceId))
                     }
                 }
             }
@@ -86,18 +115,20 @@ class SystemTtsEngine(
             }
 
             override fun onError(utteranceId: String?, errorCode: Int) {
-                utteranceId?.let { id ->
+                if (utteranceId != null && !utteranceId.startsWith("warmup_") && !utteranceId.startsWith("gap_")) {
                     val errorDesc = getErrorDescription(errorCode)
                     scope.launch {
-                        _events.emit(SpeechEvent.Error(id, errorDesc, errorCode))
+                        _events.emit(SpeechEvent.Error(utteranceId, errorDesc, errorCode))
                     }
                 }
             }
 
             override fun onRangeStart(utteranceId: String?, start: Int, end: Int, frame: Int) {
-                if (utteranceId != null && start >= 0 && end >= start) {
+                if (utteranceId != null && start >= 0 && end >= start &&
+                    !utteranceId.startsWith("warmup_") && !utteranceId.startsWith("gap_")
+                ) {
                     scope.launch {
-                        _events.emit(SpeechEvent.RangeStarted(utteranceId, start, end))
+                        _events.emit(SpeechEvent.Range(start = start, end = end, utteranceId = utteranceId))
                     }
                 }
             }
@@ -105,52 +136,69 @@ class SystemTtsEngine(
     }
 
     override fun speak(
+        sentence: String,
+        voice: VoiceInfo?,
+        settings: VoiceSettings,
+        utteranceId: String
+    ) {
+        val isSpeakerChange = lastSpokenVoiceId != null && voice?.id != lastSpokenVoiceId
+
+        if (!_isReady.value || textToSpeech == null) {
+            pendingQueue.add(QueuedSpeak(sentence, voice, settings, utteranceId, isSpeakerChange))
+            return
+        }
+
+        executeSpeak(sentence, voice, settings, utteranceId, isSpeakerChange)
+    }
+
+    private fun executeSpeak(
+        sentence: String,
+        voice: VoiceInfo?,
+        settings: VoiceSettings,
         utteranceId: String,
-        text: String,
-        voiceId: String?,
-        speed: Float,
-        pitch: Float
+        isSpeakerChange: Boolean
     ) {
         val tts = textToSpeech ?: run {
             scope.launch {
-                _events.emit(SpeechEvent.Error(utteranceId, "TextToSpeech engine not initialized"))
+                _events.emit(SpeechEvent.Error(utteranceId, "TextToSpeech engine not available"))
             }
             return
         }
 
-        activeUtteranceId = utteranceId
-        pausedText = text
-        pausedVoiceId = voiceId
-        pausedSpeed = speed
-        pausedPitch = pitch
-
         try {
-            // Apply voice selection
-            if (voiceId != null) {
-                val matchingVoice = tts.voices?.firstOrNull { it.name == voiceId }
+            // 1. Right before speak, set voice
+            if (voice?.id != null) {
+                val matchingVoice = tts.voices?.firstOrNull { it.name == voice.id }
                 if (matchingVoice != null) {
                     tts.voice = matchingVoice
                 }
             }
 
-            // Map and clamp speed & pitch to Android TTS supported ranges (0.1f - 3.0f)
-            val clampedSpeed = speed.coerceIn(0.1f, 3.0f)
-            val clampedPitch = pitch.coerceIn(0.1f, 2.0f)
-
+            // 2. Set pitch and speed rate
+            val clampedSpeed = settings.speed.coerceIn(0.1f, 3.0f)
+            val clampedPitch = settings.pitch.coerceIn(0.1f, 2.0f)
             tts.setSpeechRate(clampedSpeed)
             tts.setPitch(clampedPitch)
 
+            // 3. Optional gap insertion at speaker changes
+            if (gapMs > 0 && isSpeakerChange) {
+                tts.playSilentUtterance(gapMs, TextToSpeech.QUEUE_ADD, "gap_$utteranceId")
+            }
+
+            // 4. Enqueue utterance using QUEUE_ADD for seamless lookahead playback
             val params = Bundle().apply {
                 putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
             }
+            val result = tts.speak(sentence, TextToSpeech.QUEUE_ADD, params, utteranceId)
 
-            val result = tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+            lastSpokenVoiceId = voice?.id
+
             if (result != TextToSpeech.SUCCESS) {
                 scope.launch {
                     _events.emit(
                         SpeechEvent.Error(
                             utteranceId = utteranceId,
-                            message = "TextToSpeech.speak call failed with code $result",
+                            message = "TextToSpeech.speak QUEUE_ADD failed with code $result",
                             errorCode = result
                         )
                     )
@@ -169,21 +217,40 @@ class SystemTtsEngine(
         }
     }
 
+    private fun drainPendingQueue() {
+        while (true) {
+            val item = pendingQueue.poll() ?: break
+            executeSpeak(item.sentence, item.voice, item.settings, item.utteranceId, item.isSpeakerChange)
+        }
+    }
+
     override fun stop() {
+        pendingQueue.clear()
         textToSpeech?.stop()
-        activeUtteranceId = null
     }
 
     override fun pause() {
+        // Do not shut the engine down on pause, only stop active audio
         textToSpeech?.stop()
     }
 
-    override fun resume() {
-        val utteranceId = activeUtteranceId
-        val text = pausedText
-        if (utteranceId != null && text != null) {
-            speak(utteranceId, text, pausedVoiceId, pausedSpeed, pausedPitch)
-        }
+    override fun warmUp(voice: VoiceInfo?) {
+        val tts = textToSpeech ?: return
+        try {
+            if (voice?.id != null) {
+                tts.voices?.firstOrNull { it.name == voice.id }?.let { tts.voice = it }
+            }
+            // Silent warm-up utterance with narrator voice
+            tts.playSilentUtterance(50, TextToSpeech.QUEUE_FLUSH, "warmup_silent_${System.currentTimeMillis()}")
+        } catch (_: Exception) {}
+    }
+
+    override fun release() {
+        stop()
+        textToSpeech?.shutdown()
+        textToSpeech = null
+        _isReady.value = false
+        _engineState.value = EngineState.Uninitialized
     }
 
     override fun getAvailableVoices(): List<VoiceInfo> {
@@ -191,10 +258,12 @@ class SystemTtsEngine(
         val systemVoices = tts.voices ?: return emptyList()
 
         return systemVoices.map { voice ->
+            val gender = detectVoiceGender(voice)
             VoiceInfo(
                 id = voice.name,
                 name = formatVoiceName(voice),
                 locale = voice.locale.toLanguageTag(),
+                gender = gender,
                 quality = voice.quality,
                 latency = voice.latency,
                 requiresNetwork = voice.isNetworkConnectionRequired
@@ -202,20 +271,15 @@ class SystemTtsEngine(
         }.sortedWith(compareBy({ it.locale }, { it.name }))
     }
 
-    override fun prewarm(voiceId: String?) {
-        if (voiceId == null) return
-        val tts = textToSpeech ?: return
-        tts.voices?.firstOrNull { it.name == voiceId }?.let { voice ->
-            // Pre-selecting the voice warms up voice data in the TTS service process
-            tts.voice = voice
+    private fun detectVoiceGender(voice: Voice): VoiceGender {
+        val nameLower = voice.name.lowercase()
+        return when {
+            nameLower.contains("male") && !nameLower.contains("female") -> VoiceGender.MALE
+            nameLower.contains("female") -> VoiceGender.FEMALE
+            nameLower.contains("#male") -> VoiceGender.MALE
+            nameLower.contains("#female") -> VoiceGender.FEMALE
+            else -> VoiceGender.ANY
         }
-    }
-
-    override fun shutdown() {
-        stop()
-        textToSpeech?.shutdown()
-        textToSpeech = null
-        _engineState.value = EngineState.Uninitialized
     }
 
     private fun formatVoiceName(voice: Voice): String {
