@@ -270,6 +270,77 @@ class NovelSegmenterTest {
         assertSegmentsPartitionOriginalText(text, segments)
     }
 
+    @Test
+    fun `orphan closing quote with short narration lead-in ending in comma`() {
+        val text = "The saying goes, If my neighbor hoards grain, I hoard guns; my neighbor is my granary.\""
+        val segments = NovelSegmenter.segment(text)
+
+        assertEquals(2, segments.size)
+
+        // 1. NARRATION "The saying goes, "
+        assertEquals(SegmentType.NARRATION, segments[0].type)
+        assertEquals("The saying goes, ", segments[0].text)
+        assertEquals(0, segments[0].startOffset)
+        assertEquals(17, segments[0].endOffset)
+        assertEquals(Character.NARRATOR_ID, segments[0].effectiveSpeakerId)
+        assertTrue(segments[0].id.startsWith("n0-"))
+
+        // 2. DIALOGUE for the rest
+        assertEquals(SegmentType.DIALOGUE, segments[1].type)
+        assertEquals("If my neighbor hoards grain, I hoard guns; my neighbor is my granary.\"", segments[1].text)
+        assertEquals(17, segments[1].startOffset)
+        assertEquals(text.length, segments[1].endOffset)
+        assertEquals(Character.UNNAMED_ID, segments[1].effectiveSpeakerId)
+        assertTrue(segments[1].id.startsWith("0-"))
+
+        assertSegmentsPartitionOriginalText(text, segments)
+    }
+
+    @Test
+    fun `orphan closing quote with leading space produces dialogue segment`() {
+        val text = " this... for real? We absolutely have to pick Desert Eagle in Infinite Firepower mode!\""
+        val segments = NovelSegmenter.segment(text)
+
+        assertEquals(1, segments.size)
+        assertEquals(SegmentType.DIALOGUE, segments[0].type)
+        assertEquals(text, segments[0].text)
+        assertEquals(0, segments[0].startOffset)
+        assertEquals(text.length, segments[0].endOffset)
+        assertEquals(Character.UNNAMED_ID, segments[0].effectiveSpeakerId)
+        assertTrue(segments[0].id.startsWith("0-"))
+
+        assertSegmentsPartitionOriginalText(text, segments)
+    }
+
+    @Test
+    fun `normal full pair on its own line is unchanged`() {
+        val text = "\"Let's move out.\""
+        val segments = NovelSegmenter.segment(text)
+
+        assertEquals(1, segments.size)
+        assertEquals(SegmentType.DIALOGUE, segments[0].type)
+        assertEquals(text, segments[0].text)
+        assertEquals(0, segments[0].startOffset)
+        assertEquals(text.length, segments[0].endOffset)
+        assertEquals(Character.UNNAMED_ID, segments[0].effectiveSpeakerId)
+        assertTrue(segments[0].id.startsWith("0-"))
+
+        assertSegmentsPartitionOriginalText(text, segments)
+
+        val multilineText = "He paused.\n\"Let's move out.\"\nThey began walking."
+        val multilineSegments = NovelSegmenter.segment(multilineText)
+
+        assertEquals(3, multilineSegments.size)
+        assertEquals(SegmentType.NARRATION, multilineSegments[0].type)
+        assertEquals("He paused.\n", multilineSegments[0].text)
+        assertEquals(SegmentType.DIALOGUE, multilineSegments[1].type)
+        assertEquals("\"Let's move out.\"", multilineSegments[1].text)
+        assertEquals(SegmentType.NARRATION, multilineSegments[2].type)
+        assertEquals("\nThey began walking.", multilineSegments[2].text)
+
+        assertSegmentsPartitionOriginalText(multilineText, multilineSegments)
+    }
+
     private fun assertSegmentsPartitionOriginalText(originalText: String, segments: List<Segment>) {
         val reconstructed = segments.joinToString(separator = "") { it.text }
         assertEquals("Segments must reconstruct the original text exactly", originalText, reconstructed)

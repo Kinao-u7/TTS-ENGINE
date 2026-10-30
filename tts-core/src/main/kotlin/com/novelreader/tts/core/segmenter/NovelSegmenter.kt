@@ -251,6 +251,13 @@ object NovelSegmenter {
     }
 
     private fun findDialogueStartForOrphanClose(text: String, startBound: Int, closeQuoteIndex: Int): Int {
+        // 1. Narration lead-in ending in comma or colon (6 words or fewer, first comma/colon in paragraph)
+        val leadInStart = findLeadInDialogueStart(text, startBound, closeQuoteIndex)
+        if (leadInStart != -1) {
+            return leadInStart
+        }
+
+        // 2. Sentence terminator (. or :) within paragraph
         var lastTerminatorEnd = -1
 
         var k = startBound
@@ -273,8 +280,35 @@ object NovelSegmenter {
             }
         }
 
-        val nonWsStart = findNextNonWhitespace(text, startBound)
-        return if (nonWsStart < closeQuoteIndex) nonWsStart else startBound
+        return startBound
+    }
+
+    private fun findLeadInDialogueStart(text: String, startBound: Int, closeQuoteIndex: Int): Int {
+        var firstPunctIndex = -1
+        var k = startBound
+        while (k < closeQuoteIndex) {
+            val ch = text[k]
+            if (ch == ',' || ch == ':') {
+                firstPunctIndex = k
+                break
+            }
+            k++
+        }
+
+        if (firstPunctIndex != -1) {
+            val leadInText = text.substring(startBound, firstPunctIndex).trim()
+            if (leadInText.isNotEmpty()) {
+                val words = leadInText.split(Regex("\\s+")).filter { it.isNotEmpty() }
+                if (words.size in 1..6) {
+                    val candidateStart = findNextNonWhitespace(text, firstPunctIndex + 1)
+                    if (candidateStart < closeQuoteIndex) {
+                        return candidateStart
+                    }
+                }
+            }
+        }
+
+        return -1
     }
 
     private fun isSinglePeriod(text: String, index: Int): Boolean {

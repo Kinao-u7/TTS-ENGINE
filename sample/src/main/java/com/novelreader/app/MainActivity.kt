@@ -19,11 +19,15 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Group
+import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.SkipNext
@@ -31,12 +35,14 @@ import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -45,7 +51,11 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -53,8 +63,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -65,22 +78,27 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
 import com.novelreader.tts.android.engine.SystemTtsEngine
+import com.novelreader.tts.android.store.JsonFileCastStore
 import com.novelreader.tts.core.engine.SpeechEvent
 import com.novelreader.tts.core.model.Character
 import com.novelreader.tts.core.model.Segment
 import com.novelreader.tts.core.model.SegmentType
 import com.novelreader.tts.core.model.VoiceGender
 import com.novelreader.tts.core.model.VoiceInfo
+import com.novelreader.tts.core.model.VoiceSelector
 import com.novelreader.tts.core.model.VoiceSettings
 import com.novelreader.tts.core.playback.PlaybackController
 import com.novelreader.tts.core.segmenter.NovelSegmenter
 import com.novelreader.tts.core.segmenter.TagAttributor
+import com.novelreader.tts.core.store.CastStore
 import kotlinx.coroutines.launch
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var ttsEngine: SystemTtsEngine
     private lateinit var controller: PlaybackController
+    private lateinit var castStore: CastStore
     private val debugTracker = TtsDebugTracker()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -88,6 +106,7 @@ class MainActivity : ComponentActivity() {
 
         ttsEngine = SystemTtsEngine(this)
         controller = PlaybackController(ttsEngine, scope = lifecycleScope)
+        castStore = JsonFileCastStore(this)
 
         // Wire debug instrumentation to TTS engine speech events
         lifecycleScope.launch {
@@ -114,9 +133,10 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    ReaderScreen(
+                    MainAppScaffold(
                         ttsEngine = ttsEngine,
                         controller = controller,
+                        castStore = castStore,
                         debugTracker = debugTracker,
                         onPlayClicked = {
                             val isWarm = ttsEngine.isReady.value
@@ -144,76 +164,167 @@ He said to Xian:
 "Prepare the carriage," replied Master Xian calmly.
 The horses stamped their hooves in the cold mist."""
 
-@OptIn(ExperimentalMaterial3Api::class)
+private const val CURRENT_BOOK_ID = "sample_novel"
+private const val CURRENT_CHAPTER_ID = "chapter_1"
+
+fun formatReadableLocale(localeTag: String): String {
+    return try {
+        val tag = localeTag.replace('_', '-')
+        val locale = Locale.forLanguageTag(tag)
+        val lang = locale.getDisplayLanguage(Locale.ENGLISH)
+        val country = locale.getDisplayCountry(Locale.ENGLISH)
+        if (country.isNotBlank()) "$lang ($country)" else if (lang.isNotBlank()) lang else localeTag
+    } catch (_: Exception) {
+        localeTag
+    }
+}
+
 @Composable
-fun ReaderScreen(
+fun MainAppScaffold(
     ttsEngine: SystemTtsEngine,
     controller: PlaybackController,
+    castStore: CastStore,
     debugTracker: TtsDebugTracker,
     onPlayClicked: () -> Unit
 ) {
-    val readerState by controller.readerState.collectAsState()
-    val debugMetrics by debugTracker.metrics.collectAsState()
+    var selectedTab by remember { mutableIntStateOf(0) }
+    val scope = rememberCoroutineScope()
 
-    var chapterInputText by remember { mutableStateOf(DEFAULT_SAMPLE_TEXT) }
+    val charactersList by castStore.characters(CURRENT_BOOK_ID).collectAsState(initial = emptyList())
     var availableVoices by remember { mutableStateOf<List<VoiceInfo>>(emptyList()) }
+    var chapterInputText by remember { mutableStateOf(DEFAULT_SAMPLE_TEXT) }
+    var segments by remember { mutableStateOf<List<Segment>>(emptyList()) }
 
-    var narratorVoice by remember { mutableStateOf<VoiceInfo?>(null) }
-    var unnamedVoice by remember { mutableStateOf<VoiceInfo?>(null) }
+    val readerState by controller.readerState.collectAsState()
 
-    var characters by remember {
-        mutableStateOf(
-            listOf(
-                Character.Narrator,
-                Character.Unnamed,
-                Character(
-                    id = "char_xian",
-                    name = "Master Xian",
-                    aliases = listOf("Xian"),
-                    voiceGender = VoiceGender.MALE
-                )
-            )
-        )
+    // Sync characters with PlaybackController
+    LaunchedEffect(charactersList) {
+        if (charactersList.isNotEmpty()) {
+            controller.updateCharacters(charactersList)
+        }
     }
 
-    var segments by remember { mutableStateOf<List<Segment>>(emptyList()) }
-    var segmentForSpeakerSheet by remember { mutableStateOf<Segment?>(null) }
-    var showAddCharacterDialog by remember { mutableStateOf(false) }
-
-    // When TTS engine is ready, load available real voices from device (offline only)
+    // Load available voices once TTS engine is ready
     LaunchedEffect(readerState.isReady) {
         if (readerState.isReady) {
             val deviceVoices = ttsEngine.getAvailableVoices().filter { !it.requiresNetwork }
             availableVoices = deviceVoices
             controller.updateAvailableVoices(deviceVoices)
-
-            if (narratorVoice == null && deviceVoices.isNotEmpty()) {
-                narratorVoice = deviceVoices.firstOrNull { it.locale.startsWith("en") } ?: deviceVoices.firstOrNull()
-            }
-            if (unnamedVoice == null && deviceVoices.size > 1) {
-                unnamedVoice = deviceVoices.getOrNull(1) ?: deviceVoices.firstOrNull()
-            }
         }
     }
 
-    // Helper to perform segmentation and tag attribution
+    // Function to load and segment chapter, applying overrides and tag attribution
     fun processAndLoadChapter(textToLoad: String) {
-        val rawSegments = NovelSegmenter.segment(textToLoad)
-        val attribution = TagAttributor().attribute(rawSegments, characters)
+        scope.launch {
+            val rawSegments = NovelSegmenter.segment(textToLoad)
+            val currentChars = if (charactersList.isEmpty()) {
+                listOf(Character.Narrator, Character.Unnamed)
+            } else {
+                charactersList
+            }
 
-        // Merge newly discovered characters
-        val mergedChars = (characters + attribution.characters).distinctBy { it.id }
-        characters = mergedChars
+            val attribution = TagAttributor().attribute(rawSegments, currentChars)
 
-        controller.updateCharacters(mergedChars)
-        controller.loadSegments(attribution.segments)
-        segments = attribution.segments
+            // Auto-save any newly discovered characters into CastStore
+            for (newChar in attribution.characters) {
+                if (currentChars.none { it.id == newChar.id }) {
+                    castStore.saveCharacter(CURRENT_BOOK_ID, newChar)
+                }
+            }
+
+            // Load stored overrides for this book & chapter
+            val overridesMap = castStore.overrides(CURRENT_BOOK_ID, CURRENT_CHAPTER_ID)
+
+            // Apply overrides as speakerOverride (ignoring non-existent segment IDs silently)
+            val segmentsWithOverrides = attribution.segments.map { seg ->
+                val overrideId = overridesMap[seg.id]
+                if (overrideId != null) {
+                    seg.copy(speakerOverride = overrideId)
+                } else {
+                    seg
+                }
+            }
+
+            segments = segmentsWithOverrides
+            controller.loadSegments(segmentsWithOverrides)
+        }
     }
 
     // Initial load
     LaunchedEffect(Unit) {
         processAndLoadChapter(chapterInputText)
     }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        // Tab Navigation: Reader and Cast
+        TabRow(selectedTabIndex = selectedTab) {
+            Tab(
+                selected = selectedTab == 0,
+                onClick = { selectedTab = 0 },
+                text = { Text("Reader") },
+                icon = { Icon(Icons.Default.MenuBook, contentDescription = "Reader") }
+            )
+            Tab(
+                selected = selectedTab == 1,
+                onClick = { selectedTab = 1 },
+                text = { Text("Cast (${charactersList.size})") },
+                icon = { Icon(Icons.Default.Group, contentDescription = "Cast") }
+            )
+        }
+
+        Box(modifier = Modifier.weight(1f)) {
+            if (selectedTab == 0) {
+                ReaderTabContent(
+                    ttsEngine = ttsEngine,
+                    controller = controller,
+                    castStore = castStore,
+                    debugTracker = debugTracker,
+                    charactersList = charactersList,
+                    availableVoices = availableVoices,
+                    chapterInputText = chapterInputText,
+                    onChapterInputTextChange = { chapterInputText = it },
+                    segments = segments,
+                    onSegmentsChange = { segments = it },
+                    onLoadChapter = { processAndLoadChapter(it) },
+                    onPlayClicked = onPlayClicked,
+                    onOpenCastScreen = { selectedTab = 1 }
+                )
+            } else {
+                CastTabContent(
+                    ttsEngine = ttsEngine,
+                    controller = controller,
+                    castStore = castStore,
+                    charactersList = charactersList,
+                    availableVoices = availableVoices,
+                    segments = segments
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ReaderTabContent(
+    ttsEngine: SystemTtsEngine,
+    controller: PlaybackController,
+    castStore: CastStore,
+    debugTracker: TtsDebugTracker,
+    charactersList: List<Character>,
+    availableVoices: List<VoiceInfo>,
+    chapterInputText: String,
+    onChapterInputTextChange: (String) -> Unit,
+    segments: List<Segment>,
+    onSegmentsChange: (List<Segment>) -> Unit,
+    onLoadChapter: (String) -> Unit,
+    onPlayClicked: () -> Unit,
+    onOpenCastScreen: () -> Unit
+) {
+    val readerState by controller.readerState.collectAsState()
+    val debugMetrics by debugTracker.metrics.collectAsState()
+    val scope = rememberCoroutineScope()
+
+    var segmentForSpeakerSheet by remember { mutableStateOf<Segment?>(null) }
 
     Column(
         modifier = Modifier
@@ -226,7 +337,7 @@ fun ReaderScreen(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column {
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = "Novel Reader Multi-Voice TTS",
                     style = MaterialTheme.typography.titleMedium,
@@ -259,7 +370,7 @@ fun ReaderScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // 6. Visible Error Banners
+        // Error Banner
         if (readerState.isReady && availableVoices.isEmpty()) {
             OutlinedCard(
                 modifier = Modifier.fillMaxWidth(),
@@ -269,11 +380,7 @@ fun ReaderScreen(
                     modifier = Modifier.padding(10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(
-                        Icons.Default.Warning,
-                        contentDescription = "Error",
-                        tint = MaterialTheme.colorScheme.onErrorContainer
-                    )
+                    Icon(Icons.Default.Warning, contentDescription = "Error", tint = MaterialTheme.colorScheme.onErrorContainer)
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         text = "No offline TTS voices found on this device! Check system Text-to-Speech settings.",
@@ -295,11 +402,7 @@ fun ReaderScreen(
                     modifier = Modifier.padding(10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(
-                        Icons.Default.Warning,
-                        contentDescription = "Missing voice",
-                        tint = MaterialTheme.colorScheme.onErrorContainer
-                    )
+                    Icon(Icons.Default.Warning, contentDescription = "Missing voice", tint = MaterialTheme.colorScheme.onErrorContainer)
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         text = warning,
@@ -312,58 +415,46 @@ fun ReaderScreen(
             Spacer(modifier = Modifier.height(8.dp))
         }
 
-        // 7. Debug Panel (Latencies + Last Voice Actually Used)
+        // Debug Panel
         OutlinedCard(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.outlinedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
         ) {
-            Column(modifier = Modifier.padding(10.dp)) {
-                Text(
-                    text = "DEBUG INSTRUMENTATION & VOICE ROUTING",
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Spacer(modifier = Modifier.height(4.dp))
+            Column(modifier = Modifier.padding(8.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "First Start: ${debugMetrics.firstStartLatencyMs?.let { "${it}ms (${debugMetrics.firstStartLabel})" } ?: "—"}",
+                        text = "First: ${debugMetrics.firstStartLatencyMs?.let { "${it}ms" } ?: "—"}",
                         style = MaterialTheme.typography.bodySmall,
                         fontFamily = FontFamily.Monospace
                     )
                     Text(
-                        text = "Median Gap: ${debugMetrics.medianGapMs?.let { "${it}ms" } ?: "—"}",
+                        text = "Med Gap: ${debugMetrics.medianGapMs?.let { "${it}ms" } ?: "—"}",
                         style = MaterialTheme.typography.bodySmall,
                         fontFamily = FontFamily.Monospace
                     )
                     Text(
-                        text = "Max Gap: ${debugMetrics.maxGapMs?.let { "${it}ms" } ?: "—"}",
+                        text = "Voice: ${debugMetrics.lastVoiceName ?: readerState.activeVoiceName ?: "None yet"}",
                         style = MaterialTheme.typography.bodySmall,
-                        fontFamily = FontFamily.Monospace
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary,
+                        maxLines = 1
                     )
                 }
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(
-                    text = "Voice actually used: ${debugMetrics.lastVoiceName ?: readerState.activeVoiceName ?: "None yet"}",
-                    style = MaterialTheme.typography.bodySmall,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.primary
-                )
             }
         }
 
-        Spacer(modifier = Modifier.height(10.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
-        // 1. Chapter Paste Field + Load / Sample Buttons
+        // Chapter Input Field
         OutlinedTextField(
             value = chapterInputText,
-            onValueChange = { chapterInputText = it },
+            onValueChange = onChapterInputTextChange,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(110.dp),
+                .height(100.dp),
             label = { Text("Paste Chapter Text") },
             textStyle = MaterialTheme.typography.bodySmall,
             maxLines = 4
@@ -371,12 +462,13 @@ fun ReaderScreen(
 
         Spacer(modifier = Modifier.height(6.dp))
 
+        // Action Buttons Row
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Button(
-                onClick = { processAndLoadChapter(chapterInputText) },
+                onClick = { onLoadChapter(chapterInputText) },
                 modifier = Modifier.weight(1f)
             ) {
                 Text("Load & Segment")
@@ -384,78 +476,26 @@ fun ReaderScreen(
 
             OutlinedButton(
                 onClick = {
-                    chapterInputText = DEFAULT_SAMPLE_TEXT
-                    processAndLoadChapter(DEFAULT_SAMPLE_TEXT)
+                    onChapterInputTextChange(DEFAULT_SAMPLE_TEXT)
+                    onLoadChapter(DEFAULT_SAMPLE_TEXT)
                 },
                 modifier = Modifier.weight(1f)
             ) {
                 Text("Use Sample")
             }
 
-            FilledTonalButton(
-                onClick = { showAddCharacterDialog = true }
-            ) {
-                Icon(Icons.Default.Add, contentDescription = "Add", modifier = Modifier.size(18.dp))
+            FilledTonalButton(onClick = onOpenCastScreen) {
+                Icon(Icons.Default.Group, contentDescription = "Cast", modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(4.dp))
-                Text("Add Character")
+                Text("Cast")
             }
         }
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // 2. Voice Pickers for Narrator and Unnamed with Preview ▶ Buttons
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            VoicePickerItem(
-                label = "Narrator Voice",
-                modifier = Modifier.weight(1f),
-                availableVoices = availableVoices,
-                selectedVoice = narratorVoice,
-                onVoiceSelected = { voice ->
-                    narratorVoice = voice
-                    characters = characters.map {
-                        if (it.id == Character.NARRATOR_ID) it.copy(voiceId = voice.id) else it
-                    }
-                    controller.updateCharacters(characters)
-                },
-                onPreview = { voice ->
-                    ttsEngine.speak(
-                        sentence = "This is a preview of the narrator voice.",
-                        voice = voice,
-                        settings = VoiceSettings.Default
-                    )
-                }
-            )
-
-            VoicePickerItem(
-                label = "Unnamed Dialogue",
-                modifier = Modifier.weight(1f),
-                availableVoices = availableVoices,
-                selectedVoice = unnamedVoice,
-                onVoiceSelected = { voice ->
-                    unnamedVoice = voice
-                    characters = characters.map {
-                        if (it.id == Character.UNNAMED_ID) it.copy(voiceId = voice.id) else it
-                    }
-                    controller.updateCharacters(characters)
-                },
-                onPreview = { voice ->
-                    ttsEngine.speak(
-                        sentence = "This is a preview of the unnamed speaker voice.",
-                        voice = voice,
-                        settings = VoiceSettings.Default
-                    )
-                }
-            )
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        // 5. Segments List with Effective Speaker Names
+        // Segments List
         Text(
-            text = "Chapter Segments (${segments.size}) — Tap a dialogue quote to reassign speaker:",
+            text = "Chapter Segments (${segments.size}) — Tap dialogue to assign speaker:",
             style = MaterialTheme.typography.labelSmall,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.secondary
@@ -468,13 +508,12 @@ fun ReaderScreen(
                 .weight(1f)
                 .fillMaxWidth()
         ) {
-            itemsIndexed(segments) { index, segment ->
+            itemsIndexed(segments) { _, segment ->
                 val isHighlighted = readerState.sentenceHighlight?.let { hl ->
                     segment.startOffset <= hl.startOffset && segment.endOffset >= hl.endOffset
                 } ?: false
 
-                // 5. Find effective speaker display name
-                val speakerChar = characters.firstOrNull { it.id == segment.effectiveSpeakerId }
+                val speakerChar = charactersList.firstOrNull { it.id == segment.effectiveSpeakerId }
                 val effectiveDisplayName = speakerChar?.name ?: when (segment.effectiveSpeakerId) {
                     Character.NARRATOR_ID -> "Narrator"
                     Character.UNNAMED_ID -> "Unnamed"
@@ -488,10 +527,7 @@ fun ReaderScreen(
                         .clip(RoundedCornerShape(8.dp))
                         .then(
                             if (segment.type == SegmentType.DIALOGUE) {
-                                Modifier.clickable {
-                                    // 4. Tap dialogue to assign speaker
-                                    segmentForSpeakerSheet = segment
-                                }
+                                Modifier.clickable { segmentForSpeakerSheet = segment }
                             } else {
                                 Modifier
                             }
@@ -518,7 +554,6 @@ fun ReaderScreen(
                                 color = MaterialTheme.colorScheme.secondary
                             )
 
-                            // 5. Effective speaker name clearly displayed next to segment
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
                                     text = "Reader: ",
@@ -591,7 +626,7 @@ fun ReaderScreen(
         }
     }
 
-    // 4. Modal Bottom Sheet for Speaker Assignment
+    // Modal Bottom Sheet for Speaker Assignment
     if (segmentForSpeakerSheet != null) {
         val targetSegment = segmentForSpeakerSheet!!
         val sheetState = rememberModalBottomSheetState()
@@ -618,9 +653,8 @@ fun ReaderScreen(
                 )
                 Spacer(modifier = Modifier.height(16.dp))
 
-                // List of selectable characters: Unnamed, Narrator, and custom characters
                 LazyColumn {
-                    items(characters) { char ->
+                    items(charactersList) { char ->
                         val isSelected = targetSegment.effectiveSpeakerId == char.id
 
                         Card(
@@ -628,11 +662,14 @@ fun ReaderScreen(
                                 .fillMaxWidth()
                                 .padding(vertical = 4.dp)
                                 .clickable {
-                                    // 4. Assign via speakerOverride and play immediately in the new voice
+                                    scope.launch {
+                                        castStore.setOverride(CURRENT_BOOK_ID, CURRENT_CHAPTER_ID, targetSegment.id, char.id)
+                                    }
                                     controller.reassignSpeaker(targetSegment.id, char.id, isOverride = true)
-                                    segments = segments.map {
+                                    val updated = segments.map {
                                         if (it.id == targetSegment.id) it.copy(speakerOverride = char.id) else it
                                     }
+                                    onSegmentsChange(updated)
                                     controller.playSegment(targetSegment.id)
                                     segmentForSpeakerSheet = null
                                 },
@@ -655,7 +692,11 @@ fun ReaderScreen(
                                     )
                                     val assignedVoice = availableVoices.firstOrNull { it.id == char.voiceId }
                                     Text(
-                                        text = "Voice: ${assignedVoice?.name ?: char.voiceId ?: "Auto-selected"}",
+                                        text = if (char.readByNarrator) {
+                                            "Read by Narrator"
+                                        } else {
+                                            "Voice: ${assignedVoice?.let { "${it.name} (${formatReadableLocale(it.locale)})" } ?: "Auto-assigned"}"
+                                        },
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.secondary
                                     )
@@ -675,171 +716,449 @@ fun ReaderScreen(
             }
         }
     }
+}
 
-    // 3. Add Character Dialog
-    if (showAddCharacterDialog) {
-        var newCharName by remember { mutableStateOf("") }
-        var selectedVoiceForChar by remember { mutableStateOf<VoiceInfo?>(availableVoices.firstOrNull()) }
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun CastTabContent(
+    ttsEngine: SystemTtsEngine,
+    controller: PlaybackController,
+    castStore: CastStore,
+    charactersList: List<Character>,
+    availableVoices: List<VoiceInfo>,
+    segments: List<Segment>
+) {
+    val scope = rememberCoroutineScope()
+    var characterToEdit by remember { mutableStateOf<Character?>(null) }
+    var showAddDialog by remember { mutableStateOf(false) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+    ) {
+        // Header
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column {
+                Text(
+                    text = "Character Cast",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = "${charactersList.size} characters configured in this book",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.secondary
+                )
+            }
+
+            Button(onClick = { showAddDialog = true }) {
+                Icon(Icons.Default.Add, contentDescription = "Add", modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Add Character")
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Characters List
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            items(charactersList) { char ->
+                val lineCount = segments.count { it.effectiveSpeakerId == char.id }
+                val assignedVoice = availableVoices.firstOrNull { it.id == char.voiceId }
+
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { characterToEdit = char },
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // Avatar Initial
+                        Box(
+                            modifier = Modifier
+                                .size(44.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.primaryContainer),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = char.name.firstOrNull()?.uppercase() ?: "?",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.width(12.dp))
+
+                        // Character details
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = char.name,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                if (char.isBuiltIn) {
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "(Built-in)",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(2.dp))
+
+                            val voiceDesc = if (char.readByNarrator) {
+                                "Read by Narrator"
+                            } else if (assignedVoice != null) {
+                                "${assignedVoice.name} (${formatReadableLocale(assignedVoice.locale)})"
+                            } else {
+                                "Auto-assigned (${char.voiceGender.name})"
+                            }
+
+                            Text(
+                                text = "$voiceDesc • $lineCount ${if (lineCount == 1) "line" else "lines"} • ${char.speed}x speed",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.secondary
+                            )
+                        }
+
+                        // Preview Play ▶ Button
+                        IconButton(
+                            onClick = {
+                                val usedVoiceIds = charactersList.mapNotNull { it.voiceId }.toSet()
+                                val narratorVoiceId = charactersList.firstOrNull { it.id == Character.NARRATOR_ID }?.voiceId
+                                val voiceResult = VoiceSelector.pick(
+                                    character = char,
+                                    availableVoices = availableVoices,
+                                    usedVoices = usedVoiceIds,
+                                    bookLocale = "en-US",
+                                    narratorVoiceId = narratorVoiceId
+                                )
+                                val settings = VoiceSettings.getSettings(char)
+                                val previewText = "Hello, I am ${char.name}."
+                                ttsEngine.speak(previewText, voice = voiceResult.voice, settings = settings, utteranceId = "preview_${char.id}")
+                            }
+                        ) {
+                            Icon(Icons.Default.PlayArrow, contentDescription = "Preview voice", tint = MaterialTheme.colorScheme.primary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Edit Character Sheet
+    if (characterToEdit != null) {
+        val char = characterToEdit!!
+        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+
+        var editedName by remember { mutableStateOf(char.name) }
+        var selectedVoiceId by remember { mutableStateOf(char.voiceId) }
+        var selectedGender by remember { mutableStateOf(char.voiceGender) }
+        var editedSpeed by remember { mutableFloatStateOf(char.speed) }
+        var editedPitch by remember { mutableFloatStateOf(char.pitch) }
+        var readByNarrator by remember { mutableStateOf(char.readByNarrator) }
+        var showVoiceDropdown by remember { mutableStateOf(false) }
+
+        ModalBottomSheet(
+            onDismissRequest = { characterToEdit = null },
+            sheetState = sheetState
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 12.dp)
+            ) {
+                Text(
+                    text = if (char.isBuiltIn) "Edit ${char.name} Settings" else "Edit Character",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Name field
+                OutlinedTextField(
+                    value = editedName,
+                    onValueChange = { if (!char.isBuiltIn) editedName = it },
+                    label = { Text("Name") },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !char.isBuiltIn,
+                    supportingText = {
+                        if (char.isBuiltIn) Text("Built-in character names cannot be changed")
+                    }
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Voice Picker
+                Text(
+                    text = "Assigned Voice",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+
+                val currentSelectedVoice = availableVoices.firstOrNull { it.id == selectedVoiceId }
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    OutlinedCard(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showVoiceDropdown = true }
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = currentSelectedVoice?.let { "${it.name} (${formatReadableLocale(it.locale)})" } ?: "Auto-assigned (matches gender)",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Icon(Icons.Default.ArrowDropDown, contentDescription = "Select voice")
+                        }
+                    }
+
+                    DropdownMenu(
+                        expanded = showVoiceDropdown,
+                        onDismissRequest = { showVoiceDropdown = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Auto-assign (Default)") },
+                            onClick = {
+                                selectedVoiceId = null
+                                showVoiceDropdown = false
+                            }
+                        )
+                        availableVoices.forEach { voice ->
+                            DropdownMenuItem(
+                                text = {
+                                    Column {
+                                        Text(text = voice.name, fontWeight = FontWeight.SemiBold)
+                                        Text(
+                                            text = formatReadableLocale(voice.locale),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.secondary
+                                        )
+                                    }
+                                },
+                                onClick = {
+                                    selectedVoiceId = voice.id
+                                    showVoiceDropdown = false
+                                }
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Voice Gender
+                Text(
+                    text = "Voice Gender Preference",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf(VoiceGender.ANY, VoiceGender.MALE, VoiceGender.FEMALE).forEach { gender ->
+                        FilterChip(
+                            selected = selectedGender == gender,
+                            onClick = { selectedGender = gender },
+                            label = { Text(gender.name) }
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Speed Slider
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(text = "Speed", style = MaterialTheme.typography.labelMedium)
+                    Text(text = String.format(Locale.US, "%.1fx", editedSpeed), style = MaterialTheme.typography.bodySmall)
+                }
+                Slider(
+                    value = editedSpeed,
+                    onValueChange = { editedSpeed = it },
+                    valueRange = 0.5f..2.0f,
+                    steps = 14
+                )
+
+                // Pitch Slider
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(text = "Pitch", style = MaterialTheme.typography.labelMedium)
+                    Text(text = String.format(Locale.US, "%.1fx", editedPitch), style = MaterialTheme.typography.bodySmall)
+                }
+                Slider(
+                    value = editedPitch,
+                    onValueChange = { editedPitch = it },
+                    valueRange = 0.5f..2.0f,
+                    steps = 14
+                )
+
+                // Read by Narrator toggle
+                if (char.id != Character.NARRATOR_ID) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(text = "Read by narrator", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                            Text(text = "Lines spoken by this character will use the narrator's voice", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
+                        }
+                        Switch(
+                            checked = readByNarrator,
+                            onCheckedChange = { readByNarrator = it }
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Bottom Actions: Delete (if not built-in) and Save
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (char.isDeletable) {
+                        OutlinedButton(
+                            onClick = {
+                                scope.launch {
+                                    castStore.deleteCharacter(CURRENT_BOOK_ID, char.id)
+                                }
+                                characterToEdit = null
+                            },
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Default.Delete, contentDescription = "Delete", modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Delete")
+                        }
+                    }
+
+                    Button(
+                        onClick = {
+                            val updated = char.copy(
+                                name = editedName.trim(),
+                                voiceId = selectedVoiceId,
+                                voiceGender = selectedGender,
+                                speed = editedSpeed,
+                                pitch = editedPitch,
+                                readByNarrator = readByNarrator
+                            )
+                            scope.launch {
+                                castStore.saveCharacter(CURRENT_BOOK_ID, updated)
+                            }
+                            // Applied from the next sentence without flushing the queue
+                            controller.updateCharacters(charactersList.map { if (it.id == updated.id) updated else it })
+                            characterToEdit = null
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Save Changes")
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(20.dp))
+            }
+        }
+    }
+
+    // Add Character Dialog
+    if (showAddDialog) {
+        var newName by remember { mutableStateOf("") }
+        var newVoiceId by remember { mutableStateOf<String?>(null) }
+        var newGender by remember { mutableStateOf(VoiceGender.ANY) }
+        var newSpeed by remember { mutableFloatStateOf(1.0f) }
+        var newPitch by remember { mutableFloatStateOf(1.0f) }
+        var newReadByNarrator by remember { mutableStateOf(false) }
 
         AlertDialog(
-            onDismissRequest = { showAddCharacterDialog = false },
+            onDismissRequest = { showAddDialog = false },
             title = { Text("Add Character") },
             text = {
                 Column {
                     OutlinedTextField(
-                        value = newCharName,
-                        onValueChange = { newCharName = it },
+                        value = newName,
+                        onValueChange = { newName = it },
                         label = { Text("Character Name") },
                         modifier = Modifier.fillMaxWidth()
                     )
-                    Spacer(modifier = Modifier.height(12.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
 
-                    Text(
-                        text = "Assign Voice:",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-
-                    VoicePickerItem(
-                        label = "Voice",
-                        modifier = Modifier.fillMaxWidth(),
-                        availableVoices = availableVoices,
-                        selectedVoice = selectedVoiceForChar,
-                        onVoiceSelected = { selectedVoiceForChar = it },
-                        onPreview = { voice ->
-                            val previewText = if (newCharName.isNotBlank()) {
-                                "Hello, my name is $newCharName."
-                            } else {
-                                "Hello, this is a voice preview."
-                            }
-                            ttsEngine.speak(previewText, voice = voice, settings = VoiceSettings.Default)
+                    Text(text = "Gender Preference:", style = MaterialTheme.typography.labelSmall)
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        listOf(VoiceGender.ANY, VoiceGender.MALE, VoiceGender.FEMALE).forEach { g ->
+                            FilterChip(
+                                selected = newGender == g,
+                                onClick = { newGender = g },
+                                label = { Text(g.name) }
+                            )
                         }
-                    )
+                    }
                 }
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        if (newCharName.isNotBlank()) {
+                        if (newName.isNotBlank()) {
+                            val id = "char_${newName.lowercase().replace(Regex("[^a-z0-9]"), "_")}_${System.currentTimeMillis()}"
                             val newChar = Character(
-                                id = "char_${newCharName.lowercase().replace(Regex("[^a-z0-9]"), "_")}_${System.currentTimeMillis()}",
-                                name = newCharName.trim(),
-                                voiceId = selectedVoiceForChar?.id,
-                                voiceGender = selectedVoiceForChar?.gender ?: VoiceGender.ANY
+                                id = id,
+                                name = newName.trim(),
+                                voiceId = newVoiceId,
+                                voiceGender = newGender,
+                                speed = newSpeed,
+                                pitch = newPitch,
+                                readByNarrator = newReadByNarrator
                             )
-                            characters = characters + newChar
-                            controller.updateCharacters(characters)
-                            showAddCharacterDialog = false
+                            scope.launch {
+                                castStore.saveCharacter(CURRENT_BOOK_ID, newChar)
+                            }
+                            controller.updateCharacters(charactersList + newChar)
+                            showAddDialog = false
                         }
                     },
-                    enabled = newCharName.isNotBlank()
+                    enabled = newName.isNotBlank()
                 ) {
                     Text("Add")
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showAddCharacterDialog = false }) {
+                TextButton(onClick = { showAddDialog = false }) {
                     Text("Cancel")
                 }
             }
         )
-    }
-}
-
-@Composable
-fun VoicePickerItem(
-    label: String,
-    modifier: Modifier = Modifier,
-    availableVoices: List<VoiceInfo>,
-    selectedVoice: VoiceInfo?,
-    onVoiceSelected: (VoiceInfo) -> Unit,
-    onPreview: (VoiceInfo) -> Unit
-) {
-    var expanded by remember { mutableStateOf(false) }
-
-    OutlinedCard(modifier = modifier) {
-        Column(modifier = Modifier.padding(8.dp)) {
-            Text(
-                text = label,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.secondary,
-                fontWeight = FontWeight.Bold
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Box(modifier = Modifier.weight(1f)) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(4.dp))
-                            .clickable { expanded = true }
-                            .padding(vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = selectedVoice?.let { "${it.name} (${it.gender})" } ?: "Select Voice",
-                            style = MaterialTheme.typography.bodySmall,
-                            maxLines = 1,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Icon(Icons.Default.ArrowDropDown, contentDescription = "Select")
-                    }
-
-                    DropdownMenu(
-                        expanded = expanded,
-                        onDismissRequest = { expanded = false }
-                    ) {
-                        if (availableVoices.isEmpty()) {
-                            DropdownMenuItem(
-                                text = { Text("No voices available") },
-                                onClick = { expanded = false }
-                            )
-                        } else {
-                            availableVoices.forEach { voice ->
-                                DropdownMenuItem(
-                                    text = {
-                                        Column {
-                                            Text(
-                                                text = voice.name,
-                                                style = MaterialTheme.typography.bodySmall,
-                                                fontWeight = FontWeight.SemiBold
-                                            )
-                                            Text(
-                                                text = "${voice.locale} • Gender: ${voice.gender}",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.secondary
-                                            )
-                                        }
-                                    },
-                                    onClick = {
-                                        onVoiceSelected(voice)
-                                        expanded = false
-                                    }
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // Preview ▶ Button
-                IconButton(
-                    onClick = {
-                        selectedVoice?.let { onPreview(it) }
-                    },
-                    enabled = selectedVoice != null,
-                    modifier = Modifier.size(32.dp)
-                ) {
-                    Icon(
-                        Icons.Default.PlayArrow,
-                        contentDescription = "Preview Voice",
-                        modifier = Modifier.size(18.dp)
-                    )
-                }
-            }
-        }
     }
 }
