@@ -23,7 +23,8 @@ import kotlinx.coroutines.launch
  */
 data class SpeakerChipInfo(
     val id: String,
-    val displayName: String
+    val displayName: String,
+    val voiceName: String? = null
 )
 
 /**
@@ -39,6 +40,7 @@ data class ReaderState(
     val sentenceHighlight: TextRange? = null,
     val wordHighlight: TextRange? = null,
     val currentSpeaker: SpeakerChipInfo? = null,
+    val activeVoiceName: String? = null,
     val missingVoiceWarning: String? = null
 )
 
@@ -88,6 +90,8 @@ class PlaybackController(
     private var nextToEnqueueIndex: Int = 0
     private var playRequestedWhenReady: Boolean = false
 
+    private val utteranceVoiceNames = mutableMapOf<String, String>()
+
     private var eventCollectorJob: Job? = null
     private var readyCollectorJob: Job? = null
 
@@ -128,6 +132,7 @@ class PlaybackController(
         currentSentenceIndex = initialSentenceIndex.coerceIn(0, (sentences.size - 1).coerceAtLeast(0))
         nextToEnqueueIndex = currentSentenceIndex
         playRequestedWhenReady = false
+        utteranceVoiceNames.clear()
 
         updateReaderState(isPlaying = false)
         _state.value = if (sentences.isNotEmpty()) PlaybackState.Idle else PlaybackState.Stopped
@@ -147,6 +152,8 @@ class PlaybackController(
         }
         characters = map
     }
+
+    fun getCharacters(): List<Character> = characters.values.toList()
 
     /**
      * Sets available voices for voice selection.
@@ -280,6 +287,17 @@ class PlaybackController(
     }
 
     /**
+     * Plays the given segment immediately.
+     */
+    fun playSegment(segmentId: String) {
+        val targetSentence = sentences.firstOrNull { it.segmentId == segmentId }
+        if (targetSentence != null) {
+            jumpToSentence(targetSentence.index)
+            play()
+        }
+    }
+
+    /**
      * Reassigns a speaker for a segment.
      * Only reassigning the currently playing line flushes the engine queue and restarts
      * from that segment. Other edits apply without flushing.
@@ -353,6 +371,9 @@ class PlaybackController(
         val settings = VoiceSettings.getSettings(speaker, globalSpeed)
         val utteranceId = makeUtteranceId(sentence.index, sentence.segmentId)
 
+        val voiceName = voiceResult.voice?.name ?: voiceResult.voice?.id ?: "System Default"
+        utteranceVoiceNames[utteranceId] = voiceName
+
         speechEngine.speak(
             sentence = sentence.text,
             voice = voiceResult.voice,
@@ -367,17 +388,19 @@ class PlaybackController(
                 val sentenceIndex = parseSentenceIndex(event.utteranceId) ?: return
                 currentSentenceIndex = sentenceIndex
 
+                val voiceName = utteranceVoiceNames[event.utteranceId]
                 val sentence = sentences.getOrNull(sentenceIndex)
                 val speakerChip = sentence?.let {
                     val speakerId = segments.firstOrNull { seg -> seg.id == it.segmentId }?.effectiveSpeakerId ?: it.initialSpeakerId
                     val char = characters[speakerId] ?: characters[Character.UNNAMED_ID] ?: Character.Narrator
-                    SpeakerChipInfo(id = char.id, displayName = char.name)
+                    SpeakerChipInfo(id = char.id, displayName = char.name, voiceName = voiceName)
                 }
 
                 updateReaderState(
                     isPlaying = true,
                     sentenceHighlight = sentence?.let { TextRange(it.sentenceStartInChapter, it.sentenceEndInChapter) },
                     currentSpeaker = speakerChip,
+                    activeVoiceName = voiceName,
                     clearWordHighlight = true
                 )
 
@@ -439,6 +462,7 @@ class PlaybackController(
         isPlaying: Boolean,
         sentenceHighlight: TextRange? = null,
         currentSpeaker: SpeakerChipInfo? = null,
+        activeVoiceName: String? = null,
         clearSentenceHighlight: Boolean = false,
         clearWordHighlight: Boolean = false
     ) {
@@ -446,7 +470,7 @@ class PlaybackController(
         val activeSpeaker = currentSpeaker ?: currentSentence?.let {
             val speakerId = segments.firstOrNull { seg -> seg.id == it.segmentId }?.effectiveSpeakerId ?: it.initialSpeakerId
             val char = characters[speakerId] ?: characters[Character.UNNAMED_ID] ?: Character.Narrator
-            SpeakerChipInfo(char.id, char.name)
+            SpeakerChipInfo(char.id, char.name, activeVoiceName ?: _readerState.value.activeVoiceName)
         }
 
         val remainingWords = sentences.drop(currentSentenceIndex).sumOf { it.text.split(Regex("\\s+")).size }
@@ -461,7 +485,8 @@ class PlaybackController(
             estimatedTimeRemainingMs = estimatedMs,
             sentenceHighlight = if (clearSentenceHighlight) null else (sentenceHighlight ?: _readerState.value.sentenceHighlight),
             wordHighlight = if (clearWordHighlight) null else _readerState.value.wordHighlight,
-            currentSpeaker = activeSpeaker
+            currentSpeaker = activeSpeaker,
+            activeVoiceName = activeVoiceName ?: _readerState.value.activeVoiceName
         )
     }
 

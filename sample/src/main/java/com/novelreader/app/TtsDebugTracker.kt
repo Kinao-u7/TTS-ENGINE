@@ -13,6 +13,7 @@ data class UtteranceGapRecord(
     val isSpeakerChange: Boolean,
     val previousSpeaker: String?,
     val currentSpeaker: String,
+    val voiceName: String? = null,
     val timestamp: Long = System.currentTimeMillis()
 )
 
@@ -25,6 +26,7 @@ data class DebugMetrics(
     val medianGapMs: Long? = null,
     val maxGapMs: Long? = null,
     val totalGapsRecorded: Int = 0,
+    val lastVoiceName: String? = null,
     val recentGaps: List<UtteranceGapRecord> = emptyList()
 )
 
@@ -54,8 +56,10 @@ class TtsDebugTracker(
         Log.d(tag, "play() initiated [engine ${if (isWarm) "warm" else "cold"}]")
     }
 
-    fun onStart(utteranceId: String, speakerId: String) {
+    fun onStart(utteranceId: String, speakerId: String, voiceName: String? = null) {
         val now = System.currentTimeMillis()
+
+        Log.d(tag, "Utterance onStart: $utteranceId, speaker: $speakerId, voice: ${voiceName ?: "default"}")
 
         // 1. Time from play() to first onStart
         if (isFirstStartAfterPlay && playRequestTimestamp != null) {
@@ -66,8 +70,11 @@ class TtsDebugTracker(
             Log.d(tag, "Time from play() to first onStart: ${startLatency}ms ($label) [utt: $utteranceId]")
             _metrics.value = _metrics.value.copy(
                 firstStartLatencyMs = startLatency,
-                firstStartLabel = label
+                firstStartLabel = label,
+                lastVoiceName = voiceName
             )
+        } else {
+            _metrics.value = _metrics.value.copy(lastVoiceName = voiceName)
         }
 
         // 2. Time between onDone of previous utterance and onStart of this utterance
@@ -79,6 +86,7 @@ class TtsDebugTracker(
                 isSpeakerChange = speakerChange,
                 previousSpeaker = lastDoneSpeaker,
                 currentSpeaker = speakerId,
+                voiceName = voiceName,
                 timestamp = now
             )
 
@@ -90,7 +98,7 @@ class TtsDebugTracker(
 
             Log.d(
                 tag,
-                "Gap onDone->onStart: ${gap}ms (speakerChange=$speakerChange, from='$lastDoneSpeaker' to='$speakerId'). " +
+                "Gap onDone->onStart: ${gap}ms (speakerChange=$speakerChange, from='$lastDoneSpeaker' to='$speakerId', voice='${voiceName ?: "default"}'). " +
                     "Session median=${median}ms, max=${max}ms"
             )
 
@@ -98,6 +106,7 @@ class TtsDebugTracker(
                 medianGapMs = median,
                 maxGapMs = max,
                 totalGapsRecorded = allSessionGaps.size,
+                lastVoiceName = voiceName,
                 recentGaps = gapRecords.take(10)
             )
         }
