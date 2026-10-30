@@ -1,0 +1,42 @@
+name: Build debug APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Remove container SDK path
+        run: rm -f local.properties
+
+      - name: Build debug APK
+        run: |
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew :sample:assembleDebug --stacktrace
+          else
+            gradle :sample:assembleDebug --stacktrace
+          fi
+
+      - name: Run core tests
+        run: |
+          if [ -f ./gradlew ]; then ./gradlew :tts-core:test; else gradle :tts-core:test; fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sample-debug-apk
+          path: sample/build/outputs/apk/debug/*.apk
