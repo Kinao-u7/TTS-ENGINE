@@ -183,5 +183,23 @@ class TagAttributorTest {
         val lineWithOverride = attributedDialogue[1].copy(speakerOverride = "char_manual_override")
         assertEquals("char_manual_override", lineWithOverride.effectiveSpeakerId)
     }
+
+    @Test
+    fun `action beat before quote is not a speech tag and stays unnamed`() {
+        val text = "Xian poked the embers.\n\"We leave at dawn.\""
+        val segments = NovelSegmenter.segment(text)
+        assertEquals(2, segments.size)
+
+        val knownCharacters = listOf(
+            Character(id = "char_xian", name = "Xian")
+        )
+        val result = attributor.attribute(segments, knownCharacters)
+        val dialogue = result.segments[1]
+        assertEquals(SegmentType.DIALOGUE, dialogue.type)
+
+        // Must stay unnamed, and Xian must NOT be assigned from an action beat
+        assertNull(dialogue.speakerId)
+        assertEquals(Character.UNNAMED_ID, dialogue.effectiveSpeakerId)
+    }
 }
 

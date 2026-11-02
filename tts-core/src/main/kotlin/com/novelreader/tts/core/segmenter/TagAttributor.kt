@@ -24,25 +24,28 @@ class TagAttributor(
     verbs: List<String> = DEFAULT_VERBS
 ) {
     private val speechVerbs: Set<String> = verbs.map { it.lowercase() }.toSet()
-    private val verbsPattern: String = speechVerbs.joinToString("|") { Regex.escape(it) }
+    private val verbsPattern: String = speechVerbs
+        .flatMap { listOf(it.lowercase(), it.replaceFirstChar { c -> if (c.isLowerCase()) c.titlecase() else c.toString() }, it.uppercase()) }
+        .distinct()
+        .joinToString("|") { Regex.escape(it) }
 
     // Pattern 1a: after quote - `," said Lin`, `," asked Xian`, `," whispered Chen Yu`, `," called back Xian`
+    // Name is 1-3 capitalized words. Optional trailing particle after verb must be lowercase and not "to".
     private val postSaidNameRegex = Regex(
-        """^\s*[,—–-]?\s*(?:$verbsPattern)(?:\s+[a-z]+)?\s+(?:to\s+[A-Za-z0-9_']+(?:\s+[A-Za-z0-9_']+)*\s+)?([A-Z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*){0,2})(?:\s+to\s+[A-Za-z0-9_']+(?:\s+[A-Za-z0-9_']+)*)?\b""",
-        RegexOption.IGNORE_CASE
+        """^\s*[,—–-]?\s*(?:$verbsPattern)(?:\s+(?!to\b)[a-z][a-z0-9_']*)?\s+([A-Z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*){0,2})(?:\s+to\s+[A-Za-z0-9_']+(?:\s+[A-Za-z0-9_']+)*)?\b"""
     )
 
     // Pattern 1b: after quote - `," Lin Mo said`, `," Xian called back`, `," he said`
+    // Subject is 1-3 capitalized words or single lowercase pronoun.
     private val postNameSaidRegex = Regex(
-        """^\s*[,—–-]?\s*([A-Za-z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*){0,2})\s+(?:$verbsPattern)(?:\s+[a-z]+)?(?:\s+to\s+[A-Za-z0-9_']+(?:\s+[A-Za-z0-9_']+)*)?\b""",
-        RegexOption.IGNORE_CASE
+        """^\s*[,—–-]?\s*([A-Z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*){0,2}|[a-z]+)\s+(?:$verbsPattern)(?:\s+(?!to\b)[a-z][a-z0-9_']*)?(?:\s+to\s+[A-Za-z0-9_']+(?:\s+[A-Za-z0-9_']+)*)?\b"""
     )
 
     // Pattern 2: before quote - `Lin Mo said, "..."` or `Xian called back: "..."` or `He said to Xian:\n"..."`
     // Extracts subject before the speech verb. Note: recipient in `said to <Recipient>` is NOT the speaker!
+    // Action beats like `Xian poked the embers.` do not end with a speech verb, so they do not match.
     private val preQuoteRegex = Regex(
-        """([A-Za-z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*){0,2})\s+(?:$verbsPattern)(?:\s+[a-z]+)?(?:\s+to\s+[A-Za-z0-9_']+(?:\s+[A-Za-z0-9_']+)*)?\s*[,:]?\s*$""",
-        RegexOption.IGNORE_CASE
+        """([A-Z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*){0,2}|[a-z]+)\s+(?:$verbsPattern)(?:\s+(?!to\b)[a-z][a-z0-9_']*)?(?:\s+to\s+[A-Za-z0-9_']+(?:\s+[A-Za-z0-9_']+)*)?\s*[,:]?\s*$"""
     )
 
     /**
