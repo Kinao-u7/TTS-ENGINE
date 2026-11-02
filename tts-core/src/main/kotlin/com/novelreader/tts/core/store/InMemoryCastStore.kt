@@ -42,7 +42,7 @@ class InMemoryCastStore : CastStore {
         return flow.asStateFlow()
     }
 
-    override suspend fun saveCharacter(bookId: String, character: Character) = mutex.withLock {
+    override suspend fun saveCharacter(bookId: String, character: Character): Unit = mutex.withLock {
         val bookChars = charactersData.getOrPut(bookId) { createDefaultCharacters() }
         bookChars[character.id] = character
         ensureBuiltInsExist(bookChars)
@@ -56,7 +56,7 @@ class InMemoryCastStore : CastStore {
         flow.value = bookChars.values.toList()
     }
 
-    override suspend fun deleteCharacter(bookId: String, characterId: String) = mutex.withLock {
+    override suspend fun deleteCharacter(bookId: String, characterId: String): Unit = mutex.withLock {
         if (Character.isBuiltIn(characterId)) {
             // Built-ins cannot be deleted
             return@withLock
@@ -92,7 +92,7 @@ class InMemoryCastStore : CastStore {
         chapterId: String,
         segmentId: String,
         characterId: String?
-    ) = mutex.withLock {
+    ): Unit = mutex.withLock {
         val bookOverrides = overridesData.getOrPut(bookId) { mutableMapOf() }
         val chapterOverrides = bookOverrides.getOrPut(chapterId) { mutableMapOf() }
         if (characterId == null) {
@@ -110,9 +110,8 @@ class InMemoryCastStore : CastStore {
         ignoredNamesData[bookId]?.toSet() ?: emptySet()
     }
 
-    override suspend fun unignoreName(bookId: String, name: String) = mutex.withLock {
+    override suspend fun unignoreName(bookId: String, name: String): Unit = mutex.withLock {
         ignoredNamesData[bookId]?.remove(name.trim().lowercase())
-        Unit
     }
 
     private fun ensureBuiltInsExist(map: MutableMap<String, Character>) {
