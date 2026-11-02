@@ -347,7 +347,9 @@ fun MainAppScaffold(
                         if (chapterInputText.isNotBlank()) {
                             processAndLoadChapter(chapterInputText)
                         }
-                    }
+                    },
+                    chapterInputText = chapterInputText,
+                    processAndLoadChapter = { processAndLoadChapter(it) }
                 )
             }
         }
@@ -797,7 +799,9 @@ fun CastTabContent(
     availableVoices: List<VoiceInfo>,
     segments: List<Segment>,
     autoDetectSpeakers: Boolean,
-    onAutoDetectSpeakersChange: (Boolean) -> Unit
+    onAutoDetectSpeakersChange: (Boolean) -> Unit,
+    chapterInputText: String,
+    processAndLoadChapter: (String) -> Unit
 ) {
     val scope = rememberCoroutineScope()
     var characterToEdit by remember { mutableStateOf<Character?>(null) }
