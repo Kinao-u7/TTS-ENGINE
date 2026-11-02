@@ -185,7 +185,128 @@ class TagAttributorTest {
     }
 
     @Test
-    fun `action beat before quote is not a speech tag and stays unnamed`() {
+    fun `same-paragraph continuation assigns speaker to untagged dialogue in same paragraph`() {
+        val text = "\"Not really,\" Lin Mo said. \"The dogs' barking kept me awake.\""
+        val segments = NovelSegmenter.segment(text)
+        val dialogueSegments = segments.filter { it.type == SegmentType.DIALOGUE }
+        assertEquals(2, dialogueSegments.size)
+
+        val result = attributor.attribute(segments)
+        val attributedDialogue = result.segments.filter { it.type == SegmentType.DIALOGUE }
+        assertEquals(2, attributedDialogue.size)
+
+        val linMoChar = result.characters.firstOrNull { it.name == "Lin Mo" }
+        assertNotNull(linMoChar)
+        assertEquals(linMoChar?.id, attributedDialogue[0].speakerId)
+        assertEquals(linMoChar?.id, attributedDialogue[0].effectiveSpeakerId)
+
+        // Second quote gets Lin Mo via same-paragraph continuation
+        assertEquals(linMoChar?.id, attributedDialogue[1].speakerId)
+        assertEquals(linMoChar?.id, attributedDialogue[1].effectiveSpeakerId)
+    }
+
+    @Test
+    fun `two different speakers in one paragraph leaves untagged dialogue unnamed`() {
+        val text = "\"I agree,\" Lin Mo said. \"I disagree,\" Xian replied. \"What do you think?\""
+        val segments = NovelSegmenter.segment(text)
+        val dialogueSegments = segments.filter { it.type == SegmentType.DIALOGUE }
+        assertEquals(3, dialogueSegments.size)
+
+        val result = attributor.attribute(segments)
+        val attributedDialogue = result.segments.filter { it.type == SegmentType.DIALOGUE }
+        assertEquals(3, attributedDialogue.size)
+
+        val linMoChar = result.characters.firstOrNull { it.name == "Lin Mo" }
+        val xianChar = result.characters.firstOrNull { it.name == "Xian" }
+        assertNotNull(linMoChar)
+        assertNotNull(xianChar)
+
+        assertEquals(linMoChar?.id, attributedDialogue[0].speakerId)
+        assertEquals(xianChar?.id, attributedDialogue[1].speakerId)
+
+        // Two distinct speakers in this paragraph -> untagged third quote stays Unnamed
+        assertNull(attributedDialogue[2].speakerId)
+        assertEquals(Character.UNNAMED_ID, attributedDialogue[2].effectiveSpeakerId)
+    }
+
+    @Test
+    fun `action beat with poked the embers assigns Xian`() {
+        val text = "Xian poked the embers. \"Before noon, or before the fog thickens?\""
+        val segments = NovelSegmenter.segment(text)
+        val result = attributor.attribute(segments)
+        val dialogue = result.segments.first { it.type == SegmentType.DIALOGUE }
+
+        val xianChar = result.characters.firstOrNull { it.name == "Xian" }
+        assertNotNull(xianChar)
+        assertEquals(xianChar?.id, dialogue.speakerId)
+        assertEquals(xianChar?.id, dialogue.effectiveSpeakerId)
+    }
+
+    @Test
+    fun `action beat with laughed assigns Xian`() {
+        val text = "Xian laughed. \"You say that about everyone.\""
+        val segments = NovelSegmenter.segment(text)
+        val result = attributor.attribute(segments)
+        val dialogue = result.segments.first { it.type == SegmentType.DIALOGUE }
+
+        val xianChar = result.characters.firstOrNull { it.name == "Xian" }
+        assertNotNull(xianChar)
+        assertEquals(xianChar?.id, dialogue.speakerId)
+        assertEquals(xianChar?.id, dialogue.effectiveSpeakerId)
+    }
+
+    @Test
+    fun `action beat with pronoun He stays unnamed`() {
+        val text = "He nodded slowly. \"Sit down...\""
+        val segments = NovelSegmenter.segment(text)
+        val result = attributor.attribute(segments)
+        val dialogue = result.segments.first { it.type == SegmentType.DIALOGUE }
+
+        assertNull(dialogue.speakerId)
+        assertEquals(Character.UNNAMED_ID, dialogue.effectiveSpeakerId)
+    }
+
+    @Test
+    fun `action beat after A voice came from the trees stays unnamed`() {
+        val text = "A voice came from the trees. \"Hello? Is anyone there?\""
+        val segments = NovelSegmenter.segment(text)
+        val result = attributor.attribute(segments)
+        val dialogue = result.segments.first { it.type == SegmentType.DIALOGUE }
+
+        assertNull(dialogue.speakerId)
+        assertEquals(Character.UNNAMED_ID, dialogue.effectiveSpeakerId)
+    }
+
+    @Test
+    fun `action beat sentence containing told or said to never assigns recipient`() {
+        val text = "He told Xian to wait. \"Sit down...\""
+        val segments = NovelSegmenter.segment(text)
+        val knownCharacters = listOf(
+            Character(id = "char_xian", name = "Xian")
+        )
+        val result = attributor.attribute(segments, knownCharacters)
+        val dialogue = result.segments.first { it.type == SegmentType.DIALOGUE }
+
+        // Recipient Xian must NOT be assigned, and pronoun He stays unnamed
+        assertNull(dialogue.speakerId)
+        assertEquals(Character.UNNAMED_ID, dialogue.effectiveSpeakerId)
+    }
+
+    @Test
+    fun `priority order respects manual override over speech tag over continuation over action beat over unnamed`() {
+        // Quote with action beat before and speech tag after: speech tag wins over action beat
+        val text = "Xian smiled. \"Ready,\" Lin Mo said."
+        val segments = NovelSegmenter.segment(text)
+        val result = attributor.attribute(segments)
+        val dialogue = result.segments.first { it.type == SegmentType.DIALOGUE }
+
+        val linMoChar = result.characters.firstOrNull { it.name == "Lin Mo" }
+        assertNotNull(linMoChar)
+        assertEquals("Speech tag Lin Mo takes priority over action beat Xian", linMoChar?.id, dialogue.speakerId)
+    }
+
+    @Test
+    fun `action beat on previous line does not cross paragraph boundary`() {
         val text = "Xian poked the embers.\n\"We leave at dawn.\""
         val segments = NovelSegmenter.segment(text)
         assertEquals(2, segments.size)
@@ -197,7 +318,7 @@ class TagAttributorTest {
         val dialogue = result.segments[1]
         assertEquals(SegmentType.DIALOGUE, dialogue.type)
 
-        // Must stay unnamed, and Xian must NOT be assigned from an action beat
+        // Across newline paragraph boundary -> stays unnamed
         assertNull(dialogue.speakerId)
         assertEquals(Character.UNNAMED_ID, dialogue.effectiveSpeakerId)
     }
