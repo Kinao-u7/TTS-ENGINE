@@ -42,49 +42,53 @@ class InMemoryCastStore : CastStore {
         return flow.asStateFlow()
     }
 
-    override suspend fun saveCharacter(bookId: String, character: Character): Unit = mutex.withLock {
-        val bookChars = charactersData.getOrPut(bookId) { createDefaultCharacters() }
-        bookChars[character.id] = character
-        ensureBuiltInsExist(bookChars)
+    override suspend fun saveCharacter(bookId: String, character: Character) {
+        mutex.withLock {
+            val bookChars = charactersData.getOrPut(bookId) { createDefaultCharacters() }
+            bookChars[character.id] = character
+            ensureBuiltInsExist(bookChars)
 
-        // Saving a character unignores its name and aliases
-        val ignored = ignoredNamesData.getOrPut(bookId) { mutableSetOf() }
-        ignored.remove(character.name.trim().lowercase())
-        character.aliases.forEach { ignored.remove(it.trim().lowercase()) }
+            // Saving a character unignores its name and aliases
+            val ignored = ignoredNamesData.getOrPut(bookId) { mutableSetOf() }
+            ignored.remove(character.name.trim().lowercase())
+            character.aliases.forEach { ignored.remove(it.trim().lowercase()) }
 
-        val flow = getOrCreateFlowLocked(bookId)
-        flow.value = bookChars.values.toList()
+            val flow = getOrCreateFlowLocked(bookId)
+            flow.value = bookChars.values.toList()
+        }
     }
 
-    override suspend fun deleteCharacter(bookId: String, characterId: String): Unit = mutex.withLock {
-        if (Character.isBuiltIn(characterId)) {
-            // Built-ins cannot be deleted
-            return@withLock
-        }
+    override suspend fun deleteCharacter(bookId: String, characterId: String) {
+        mutex.withLock {
+            if (Character.isBuiltIn(characterId)) {
+                // Built-ins cannot be deleted
+                return@withLock
+            }
 
-        val bookChars = charactersData.getOrPut(bookId) { createDefaultCharacters() }
-        val charToDelete = bookChars[characterId] ?: return@withLock
+            val bookChars = charactersData.getOrPut(bookId) { createDefaultCharacters() }
+            val charToDelete = bookChars[characterId] ?: return@withLock
 
-        // Add deleted character's name and aliases to the ignored list
-        val ignored = ignoredNamesData.getOrPut(bookId) { mutableSetOf() }
-        ignored.add(charToDelete.name.trim().lowercase())
-        charToDelete.aliases.forEach { ignored.add(it.trim().lowercase()) }
+            // Add deleted character's name and aliases to the ignored list
+            val ignored = ignoredNamesData.getOrPut(bookId) { mutableSetOf() }
+            ignored.add(charToDelete.name.trim().lowercase())
+            charToDelete.aliases.forEach { ignored.add(it.trim().lowercase()) }
 
-        bookChars.remove(characterId)
-        ensureBuiltInsExist(bookChars)
+            bookChars.remove(characterId)
+            ensureBuiltInsExist(bookChars)
 
-        // Revert lines: remove any overrides in this book pointing to the deleted character
-        overridesData[bookId]?.values?.forEach { chapterMap ->
-            val iterator = chapterMap.entries.iterator()
-            while (iterator.hasNext()) {
-                if (iterator.next().value == characterId) {
-                    iterator.remove()
+            // Revert lines: remove any overrides in this book pointing to the deleted character
+            overridesData[bookId]?.values?.forEach { chapterMap ->
+                val iterator = chapterMap.entries.iterator()
+                while (iterator.hasNext()) {
+                    if (iterator.next().value == characterId) {
+                        iterator.remove()
+                    }
                 }
             }
-        }
 
-        val flow = getOrCreateFlowLocked(bookId)
-        flow.value = bookChars.values.toList()
+            val flow = getOrCreateFlowLocked(bookId)
+            flow.value = bookChars.values.toList()
+        }
     }
 
     override suspend fun setOverride(
@@ -92,26 +96,34 @@ class InMemoryCastStore : CastStore {
         chapterId: String,
         segmentId: String,
         characterId: String?
-    ): Unit = mutex.withLock {
-        val bookOverrides = overridesData.getOrPut(bookId) { mutableMapOf() }
-        val chapterOverrides = bookOverrides.getOrPut(chapterId) { mutableMapOf() }
-        if (characterId == null) {
-            chapterOverrides.remove(segmentId)
-        } else {
-            chapterOverrides[segmentId] = characterId
+    ) {
+        mutex.withLock {
+            val bookOverrides = overridesData.getOrPut(bookId) { mutableMapOf() }
+            val chapterOverrides = bookOverrides.getOrPut(chapterId) { mutableMapOf() }
+            if (characterId == null) {
+                chapterOverrides.remove(segmentId)
+            } else {
+                chapterOverrides[segmentId] = characterId
+            }
         }
     }
 
-    override suspend fun overrides(bookId: String, chapterId: String): Map<String, String> = mutex.withLock {
-        overridesData[bookId]?.get(chapterId)?.toMap() ?: emptyMap()
+    override suspend fun overrides(bookId: String, chapterId: String): Map<String, String> {
+        return mutex.withLock {
+            overridesData[bookId]?.get(chapterId)?.toMap() ?: emptyMap()
+        }
     }
 
-    override suspend fun ignoredNames(bookId: String): Set<String> = mutex.withLock {
-        ignoredNamesData[bookId]?.toSet() ?: emptySet()
+    override suspend fun ignoredNames(bookId: String): Set<String> {
+        return mutex.withLock {
+            ignoredNamesData[bookId]?.toSet() ?: emptySet()
+        }
     }
 
-    override suspend fun unignoreName(bookId: String, name: String): Unit = mutex.withLock {
-        ignoredNamesData[bookId]?.remove(name.trim().lowercase())
+    override suspend fun unignoreName(bookId: String, name: String) {
+        mutex.withLock {
+            ignoredNamesData[bookId]?.remove(name.trim().lowercase())
+        }
     }
 
     private fun ensureBuiltInsExist(map: MutableMap<String, Character>) {

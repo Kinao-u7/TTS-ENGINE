@@ -119,54 +119,58 @@ class JsonFileCastStore(
         return flow.asStateFlow()
     }
 
-    override suspend fun saveCharacter(bookId: String, character: Character): Unit = withContext(ioDispatcher) {
-        mutex.withLock {
-            val bookData = loadOrCreateBookData(bookId)
-            bookData.characters[character.id] = character
-            ensureBuiltInsExist(bookData.characters)
+    override suspend fun saveCharacter(bookId: String, character: Character) {
+        withContext(ioDispatcher) {
+            mutex.withLock {
+                val bookData = loadOrCreateBookData(bookId)
+                bookData.characters[character.id] = character
+                ensureBuiltInsExist(bookData.characters)
 
-            // Re-adding or updating a character unignores its name and aliases
-            bookData.ignoredNames.remove(character.name.trim().lowercase())
-            character.aliases.forEach { bookData.ignoredNames.remove(it.trim().lowercase()) }
+                // Re-adding or updating a character unignores its name and aliases
+                bookData.ignoredNames.remove(character.name.trim().lowercase())
+                character.aliases.forEach { bookData.ignoredNames.remove(it.trim().lowercase()) }
 
-            saveBookDataToDisk(bookId, bookData)
+                saveBookDataToDisk(bookId, bookData)
 
-            val flow = getOrCreateFlowLocked(bookId)
-            flow.value = bookData.characters.values.toList()
+                val flow = getOrCreateFlowLocked(bookId)
+                flow.value = bookData.characters.values.toList()
+            }
         }
     }
 
-    override suspend fun deleteCharacter(bookId: String, characterId: String): Unit = withContext(ioDispatcher) {
-        if (Character.isBuiltIn(characterId)) {
-            // Built-ins cannot be deleted
-            return@withContext
-        }
-
-        mutex.withLock {
-            val bookData = loadOrCreateBookData(bookId)
-            val charToDelete = bookData.characters[characterId] ?: return@withLock
-
-            // Add deleted character name and its aliases to ignoredNames so it won't be recreated on reload
-            bookData.ignoredNames.add(charToDelete.name.trim().lowercase())
-            charToDelete.aliases.forEach { bookData.ignoredNames.add(it.trim().lowercase()) }
-
-            bookData.characters.remove(characterId)
-            ensureBuiltInsExist(bookData.characters)
-
-            // Revert lines: remove any overrides in this book pointing to the deleted character
-            bookData.overrides.values.forEach { chapterMap ->
-                val iterator = chapterMap.entries.iterator()
-                while (iterator.hasNext()) {
-                    if (iterator.next().value == characterId) {
-                        iterator.remove()
-                    }
-                }
+    override suspend fun deleteCharacter(bookId: String, characterId: String) {
+        withContext(ioDispatcher) {
+            if (Character.isBuiltIn(characterId)) {
+                // Built-ins cannot be deleted
+                return@withContext
             }
 
-            saveBookDataToDisk(bookId, bookData)
+            mutex.withLock {
+                val bookData = loadOrCreateBookData(bookId)
+                val charToDelete = bookData.characters[characterId] ?: return@withLock
 
-            val flow = getOrCreateFlowLocked(bookId)
-            flow.value = bookData.characters.values.toList()
+                // Add deleted character name and its aliases to ignoredNames so it won't be recreated on reload
+                bookData.ignoredNames.add(charToDelete.name.trim().lowercase())
+                charToDelete.aliases.forEach { bookData.ignoredNames.add(it.trim().lowercase()) }
+
+                bookData.characters.remove(characterId)
+                ensureBuiltInsExist(bookData.characters)
+
+                // Revert lines: remove any overrides in this book pointing to the deleted character
+                bookData.overrides.values.forEach { chapterMap ->
+                    val iterator = chapterMap.entries.iterator()
+                    while (iterator.hasNext()) {
+                        if (iterator.next().value == characterId) {
+                            iterator.remove()
+                        }
+                    }
+                }
+
+                saveBookDataToDisk(bookId, bookData)
+
+                val flow = getOrCreateFlowLocked(bookId)
+                flow.value = bookData.characters.values.toList()
+            }
         }
     }
 
@@ -175,39 +179,47 @@ class JsonFileCastStore(
         chapterId: String,
         segmentId: String,
         characterId: String?
-    ): Unit = withContext(ioDispatcher) {
-        mutex.withLock {
-            val bookData = loadOrCreateBookData(bookId)
-            val chapterOverrides = bookData.overrides.getOrPut(chapterId) { mutableMapOf() }
-            if (characterId == null) {
-                chapterOverrides.remove(segmentId)
-            } else {
-                chapterOverrides[segmentId] = characterId
+    ) {
+        withContext(ioDispatcher) {
+            mutex.withLock {
+                val bookData = loadOrCreateBookData(bookId)
+                val chapterOverrides = bookData.overrides.getOrPut(chapterId) { mutableMapOf() }
+                if (characterId == null) {
+                    chapterOverrides.remove(segmentId)
+                } else {
+                    chapterOverrides[segmentId] = characterId
+                }
+
+                saveBookDataToDisk(bookId, bookData)
             }
-
-            saveBookDataToDisk(bookId, bookData)
         }
     }
 
-    override suspend fun overrides(bookId: String, chapterId: String): Map<String, String> = withContext(ioDispatcher) {
-        mutex.withLock {
-            val bookData = loadOrCreateBookData(bookId)
-            bookData.overrides[chapterId]?.toMap() ?: emptyMap()
+    override suspend fun overrides(bookId: String, chapterId: String): Map<String, String> {
+        return withContext(ioDispatcher) {
+            mutex.withLock {
+                val bookData = loadOrCreateBookData(bookId)
+                bookData.overrides[chapterId]?.toMap() ?: emptyMap()
+            }
         }
     }
 
-    override suspend fun ignoredNames(bookId: String): Set<String> = withContext(ioDispatcher) {
-        mutex.withLock {
-            val bookData = loadOrCreateBookData(bookId)
-            bookData.ignoredNames.toSet()
+    override suspend fun ignoredNames(bookId: String): Set<String> {
+        return withContext(ioDispatcher) {
+            mutex.withLock {
+                val bookData = loadOrCreateBookData(bookId)
+                bookData.ignoredNames.toSet()
+            }
         }
     }
 
-    override suspend fun unignoreName(bookId: String, name: String): Unit = withContext(ioDispatcher) {
-        mutex.withLock {
-            val bookData = loadOrCreateBookData(bookId)
-            bookData.ignoredNames.remove(name.trim().lowercase())
-            saveBookDataToDisk(bookId, bookData)
+    override suspend fun unignoreName(bookId: String, name: String) {
+        withContext(ioDispatcher) {
+            mutex.withLock {
+                val bookData = loadOrCreateBookData(bookId)
+                bookData.ignoredNames.remove(name.trim().lowercase())
+                saveBookDataToDisk(bookId, bookData)
+            }
         }
     }
 
