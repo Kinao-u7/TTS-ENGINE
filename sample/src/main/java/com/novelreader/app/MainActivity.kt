@@ -94,41 +94,45 @@ import com.novelreader.tts.core.playback.PlaybackController
 import com.novelreader.tts.core.segmenter.NovelSegmenter
 import com.novelreader.tts.core.segmenter.TagAttributor
 import com.novelreader.tts.core.store.CastStore
+import com.novelreader.tts.core.store.PositionStore
+import com.novelreader.tts.core.store.ReadingPositionHelper
+import com.novelreader.tts.android.service.TtsPlaybackService
+import android.Manifest
+import android.content.ComponentName
+import android.content.Intent
+import android.content.ServiceConnection
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.IBinder
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.launch
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
-    private lateinit var ttsEngine: SystemTtsEngine
-    private lateinit var controller: PlaybackController
+    private var serviceBinder by mutableStateOf<TtsPlaybackService.LocalBinder?>(null)
     private lateinit var castStore: CastStore
     private val debugTracker = TtsDebugTracker()
+
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            serviceBinder = service as? TtsPlaybackService.LocalBinder
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            serviceBinder = null
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        ttsEngine = SystemTtsEngine(this)
-        controller = PlaybackController(ttsEngine, scope = lifecycleScope)
         castStore = JsonFileCastStore(this)
 
-        // Wire debug instrumentation to TTS engine speech events
-        lifecycleScope.launch {
-            ttsEngine.events.collect { event ->
-                when (event) {
-                    is SpeechEvent.Started -> {
-                        val activeSpeaker = controller.readerState.value.currentSpeaker?.id ?: "unknown"
-                        val activeVoice = controller.readerState.value.activeVoiceName
-                            ?: controller.readerState.value.currentSpeaker?.voiceName
-                        debugTracker.onStart(event.utteranceId, activeSpeaker, activeVoice)
-                    }
-                    is SpeechEvent.Done -> {
-                        val activeSpeaker = controller.readerState.value.currentSpeaker?.id ?: "unknown"
-                        debugTracker.onDone(event.utteranceId, activeSpeaker)
-                    }
-                    else -> {}
-                }
-            }
-        }
+        val serviceIntent = Intent(this, TtsPlaybackService::class.java)
+        bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
 
         setContent {
             MaterialTheme {
@@ -136,17 +140,49 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    MainAppScaffold(
-                        ttsEngine = ttsEngine,
-                        controller = controller,
-                        castStore = castStore,
-                        debugTracker = debugTracker,
-                        onPlayClicked = {
-                            val isWarm = ttsEngine.isReady.value
-                            debugTracker.onPlay(isWarm)
-                            controller.play()
+                    val binder = serviceBinder
+                    if (binder != null) {
+                        // Wire debug instrumentation to TTS engine speech events
+                        LaunchedEffect(binder) {
+                            binder.ttsEngine.events.collect { event ->
+                                when (event) {
+                                    is SpeechEvent.Started -> {
+                                        val activeSpeaker = binder.controller.readerState.value.currentSpeaker?.id ?: "unknown"
+                                        val activeVoice = binder.controller.readerState.value.activeVoiceName
+                                            ?: binder.controller.readerState.value.currentSpeaker?.voiceName
+                                        debugTracker.onStart(event.utteranceId, activeSpeaker, activeVoice)
+                                    }
+                                    is SpeechEvent.Done -> {
+                                        val activeSpeaker = binder.controller.readerState.value.currentSpeaker?.id ?: "unknown"
+                                        debugTracker.onDone(event.utteranceId, activeSpeaker)
+                                    }
+                                    else -> {}
+                                }
+                            }
                         }
-                    )
+
+                        MainAppScaffold(
+                            ttsEngine = binder.ttsEngine,
+                            controller = binder.controller,
+                            positionStore = binder.positionStore,
+                            serviceBinder = binder,
+                            castStore = castStore,
+                            debugTracker = debugTracker,
+                            onPlayClicked = {
+                                val isWarm = binder.ttsEngine.isReady.value
+                                debugTracker.onPlay(isWarm)
+                                val startIntent = Intent(this@MainActivity, TtsPlaybackService::class.java).apply {
+                                    action = TtsPlaybackService.ACTION_START_FOREGROUND
+                                }
+                                ContextCompat.startForegroundService(this@MainActivity, startIntent)
+                                binder.controller.play()
+                            }
+                        )
+                    } else {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text(text = "Connecting to TTS Playback Service...", style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
                 }
             }
         }
@@ -154,7 +190,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        controller.release()
+        try {
+            unbindService(serviceConnection)
+        } catch (_: Exception) {}
+        // The service owns the controller and ttsEngine and manages its own lifecycle.
     }
 }
 
@@ -181,6 +220,8 @@ fun formatReadableLocale(localeTag: String): String {
 fun MainAppScaffold(
     ttsEngine: SystemTtsEngine,
     controller: PlaybackController,
+    positionStore: PositionStore,
+    serviceBinder: TtsPlaybackService.LocalBinder?,
     castStore: CastStore,
     debugTracker: TtsDebugTracker,
     onPlayClicked: () -> Unit
@@ -195,11 +236,33 @@ fun MainAppScaffold(
     val charactersList by castStore.characters(STABLE_BOOK_ID).collectAsState(initial = emptyList())
     var availableVoices by remember { mutableStateOf<List<VoiceInfo>>(emptyList()) }
 
+    // Notification permission check on Android 13+
+    var hasNotificationPermission by remember {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            } else {
+                true
+            }
+        )
+    }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        hasNotificationPermission = isGranted
+    }
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotificationPermission) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     // Remember the last pasted text across restarts (empty string on fresh launch)
     var chapterInputText by remember {
         mutableStateOf(prefs.getString("last_pasted_text", "") ?: "")
     }
     var segments by remember { mutableStateOf<List<Segment>>(emptyList()) }
+    var resumedFromSentence by remember { mutableStateOf<Int?>(null) }
 
     val readerState by controller.readerState.collectAsState()
 
@@ -228,6 +291,7 @@ fun MainAppScaffold(
             controller.stop()
             segments = emptyList()
             controller.loadSegments(emptyList())
+            resumedFromSentence = null
 
             if (textToLoad.isBlank()) {
                 prefs.edit().putString("last_pasted_text", "").apply()
@@ -239,6 +303,7 @@ fun MainAppScaffold(
 
             // Derive chapterId from hash of the loaded text so overrides never collide
             val chapterId = deriveChapterId(textToLoad)
+            serviceBinder?.setBookAndChapter(STABLE_BOOK_ID, chapterId, "Chapter ${chapterId.takeLast(6)}")
 
             val rawSegments = NovelSegmenter.segment(textToLoad)
             val currentChars = if (charactersList.isEmpty()) {
@@ -288,7 +353,19 @@ fun MainAppScaffold(
             }
 
             segments = finalSegments
+
+            // Retrieve saved reading position and clamp safely
+            val savedPosition = positionStore.getPosition(STABLE_BOOK_ID, chapterId)
             controller.loadSegments(finalSegments)
+
+            if (savedPosition != null && savedPosition > 0) {
+                val sentenceCount = controller.readerState.value.sentenceCount
+                val clamped = ReadingPositionHelper.clampSentenceIndex(savedPosition, sentenceCount)
+                if (clamped > 0) {
+                    controller.jumpToSentence(clamped)
+                    resumedFromSentence = clamped
+                }
+            }
         }
     }
 
@@ -330,7 +407,17 @@ fun MainAppScaffold(
                     onSegmentsChange = { segments = it },
                     onLoadChapter = { processAndLoadChapter(it) },
                     onPlayClicked = onPlayClicked,
-                    onOpenCastScreen = { selectedTab = 1 }
+                    onOpenCastScreen = { selectedTab = 1 },
+                    hasNotificationPermission = hasNotificationPermission,
+                    resumedFromSentence = resumedFromSentence,
+                    onRestartFromBeginning = {
+                        controller.jumpToSentence(0)
+                        resumedFromSentence = null
+                        val chapterId = deriveChapterId(chapterInputText)
+                        scope.launch {
+                            positionStore.clearPosition(STABLE_BOOK_ID, chapterId)
+                        }
+                    }
                 )
             } else {
                 CastTabContent(
@@ -370,7 +457,10 @@ fun ReaderTabContent(
     onSegmentsChange: (List<Segment>) -> Unit,
     onLoadChapter: (String) -> Unit,
     onPlayClicked: () -> Unit,
-    onOpenCastScreen: () -> Unit
+    onOpenCastScreen: () -> Unit,
+    hasNotificationPermission: Boolean = true,
+    resumedFromSentence: Int? = null,
+    onRestartFromBeginning: () -> Unit = {}
 ) {
     val readerState by controller.readerState.collectAsState()
     val debugMetrics by debugTracker.metrics.collectAsState()
@@ -547,6 +637,43 @@ fun ReaderTabContent(
         }
 
         Spacer(modifier = Modifier.height(8.dp))
+
+        // Subtle inline hint if notification permission is unavailable
+        if (!hasNotificationPermission) {
+            Text(
+                text = "Notification controls unavailable (notification permission not granted)",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+        }
+
+        // Resumed reading position indicator
+        if (resumedFromSentence != null) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f))
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Resumed at sentence ${resumedFromSentence + 1}",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+                TextButton(
+                    onClick = onRestartFromBeginning,
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                ) {
+                    Text("Start Over", style = MaterialTheme.typography.labelSmall)
+                }
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+        }
 
         // Segments List
         Text(
