@@ -1,3 +1,5 @@
+@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+
 package com.novelreader.app
 
 import android.content.Context
@@ -218,6 +220,7 @@ fun formatReadableLocale(localeTag: String): String {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainAppScaffold(
     ttsEngine: SystemTtsEngine,
