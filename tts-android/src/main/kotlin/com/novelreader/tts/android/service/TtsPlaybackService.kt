@@ -51,6 +51,29 @@ class TtsPlaybackService : Service() {
         fun setBookAndChapter(bookId: String, chapterId: String, chapterTitle: String = "Chapter") {
             this@TtsPlaybackService.setBookAndChapter(bookId, chapterId, chapterTitle)
         }
+
+        fun play(): Boolean {
+            val canPlay = this@TtsPlaybackService.audioFocusStateMachine.onPlayRequested()
+            if (canPlay) {
+                this@TtsPlaybackService.controller.play()
+            }
+            return canPlay
+        }
+
+        fun pause() {
+            this@TtsPlaybackService.audioFocusStateMachine.onPauseRequested()
+            this@TtsPlaybackService.controller.pause()
+        }
+
+        fun stop() {
+            this@TtsPlaybackService.audioFocusStateMachine.onStopRequested()
+            this@TtsPlaybackService.controller.stop()
+            this@TtsPlaybackService.stopForegroundAndSelf()
+        }
+
+        fun setAudioFocusSettings(mode: AudioFocusMode, keepReading: Boolean) {
+            this@TtsPlaybackService.setAudioFocusSettings(mode, keepReading)
+        }
     }
 
     private val binder = LocalBinder()
@@ -66,7 +89,7 @@ class TtsPlaybackService : Service() {
     private lateinit var mediaSession: MediaSessionCompat
     private lateinit var notificationManager: NotificationManager
     private lateinit var audioManager: AudioManager
-    private lateinit var audioFocusRequest: AudioFocusRequestCompat
+    private var currentFocusRequest: AudioFocusRequestCompat? = null
     private lateinit var audioFocusStateMachine: TtsAudioFocusStateMachine
 
     private var currentBookId: String? = null
@@ -77,7 +100,6 @@ class TtsPlaybackService : Service() {
     private var isReceiverRegistered: Boolean = false
 
     private var autoStopJob: Job? = null
-    private var abandonFocusJob: Job? = null
     private var throttledSaveJob: Job? = null
 
     private val becomingNoisyReceiver = object : BroadcastReceiver() {
@@ -189,42 +211,66 @@ class TtsPlaybackService : Service() {
         }
     }
 
-    private fun setupAudioFocus() {
+    fun setAudioFocusSettings(mode: AudioFocusMode, keepReading: Boolean) {
+        audioFocusStateMachine.updateSettings(mode, keepReading)
+    }
+
+    private fun buildFocusRequest(gainType: Int): AudioFocusRequestCompat {
         val audioAttributes = AudioAttributesCompat.Builder()
             .setUsage(AudioAttributesCompat.USAGE_MEDIA)
             .setContentType(AudioAttributesCompat.CONTENT_TYPE_SPEECH)
             .build()
 
-        audioFocusRequest = AudioFocusRequestCompat.Builder(AudioManagerCompat.AUDIOFOCUS_GAIN)
+        return AudioFocusRequestCompat.Builder(gainType)
             .setAudioAttributes(audioAttributes)
             .setOnAudioFocusChangeListener { focusChange ->
                 audioFocusStateMachine.onAudioFocusChange(focusChange)
             }
-            .setWillPauseWhenDucked(true)
             .build()
+    }
 
-        audioFocusStateMachine = TtsAudioFocusStateMachine(object : TtsAudioFocusStateMachine.Listener {
-            override fun onPausePlayback() {
-                controller.pause()
-            }
+    private fun setupAudioFocus() {
+        val prefs = getSharedPreferences("novel_reader_prefs", Context.MODE_PRIVATE)
+        val savedModeName = prefs.getString("audio_focus_mode", AudioFocusMode.PAUSE_OTHERS.name)
+            ?: AudioFocusMode.PAUSE_OTHERS.name
+        val initialMode = try {
+            AudioFocusMode.valueOf(savedModeName)
+        } catch (_: Exception) {
+            AudioFocusMode.PAUSE_OTHERS
+        }
+        val initialKeepReading = prefs.getBoolean("keep_reading_when_other_audio_starts", false)
 
-            override fun onResumePlayback() {
-                controller.play()
-            }
+        audioFocusStateMachine = TtsAudioFocusStateMachine(
+            callback = object : TtsFocusCallback {
+                override fun onPausePlayback() {
+                    controller.pause()
+                }
 
-            override fun onStopPlayback() {
-                controller.stop()
-            }
+                override fun onResumePlayback() {
+                    controller.play()
+                }
 
-            override fun onRequestSystemFocus(): Boolean {
-                val res = AudioManagerCompat.requestAudioFocus(audioManager, audioFocusRequest)
-                return res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-            }
+                override fun onRequestSystemFocus(focusGain: Int): Boolean {
+                    val request = buildFocusRequest(focusGain)
+                    currentFocusRequest = request
+                    val res = AudioManagerCompat.requestAudioFocus(audioManager, request)
+                    return res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+                }
 
-            override fun onAbandonSystemFocus() {
-                AudioManagerCompat.abandonAudioFocusRequest(audioManager, audioFocusRequest)
-            }
-        })
+                override fun onAbandonSystemFocus() {
+                    currentFocusRequest?.let { request ->
+                        AudioManagerCompat.abandonAudioFocusRequest(audioManager, request)
+                        currentFocusRequest = null
+                    }
+                }
+
+                override fun getAudioMode(): Int {
+                    return audioManager.mode
+                }
+            },
+            mode = initialMode,
+            keepReadingWhenOtherAudioStarts = initialKeepReading
+        )
     }
 
     private fun registerBecomingNoisyReceiver() {
@@ -257,7 +303,6 @@ class TtsPlaybackService : Service() {
     private fun handleStateChange(readerState: ReaderState) {
         if (readerState.isPlaying) {
             cancelAutoStopTimer()
-            cancelAbandonFocusTimer()
 
             // Ensure service is in foreground when playing
             startForegroundIfNeeded()
@@ -268,7 +313,6 @@ class TtsPlaybackService : Service() {
             updateMediaSessionPlaybackState(false)
             if (isForegroundService) {
                 updateNotification(readerState)
-                scheduleAbandonFocusTimer()
                 scheduleAutoStopTimer()
             }
         }
@@ -398,19 +442,6 @@ class TtsPlaybackService : Service() {
         }
     }
 
-    private fun scheduleAbandonFocusTimer() {
-        abandonFocusJob?.cancel()
-        abandonFocusJob = serviceScope.launch {
-            delay(ABANDON_FOCUS_TIMEOUT_MS)
-            audioFocusStateMachine.onAbandonTimeout()
-        }
-    }
-
-    private fun cancelAbandonFocusTimer() {
-        abandonFocusJob?.cancel()
-        abandonFocusJob = null
-    }
-
     private fun scheduleAutoStopTimer() {
         autoStopJob?.cancel()
         autoStopJob = serviceScope.launch {
@@ -426,7 +457,6 @@ class TtsPlaybackService : Service() {
 
     private fun stopForegroundAndSelf() {
         cancelAutoStopTimer()
-        cancelAbandonFocusTimer()
 
         // Flush any pending position save immediately
         val bookId = currentBookId
@@ -483,7 +513,6 @@ class TtsPlaybackService : Service() {
         private const val REQUEST_CODE_STOP = 104
 
         private const val THROTTLE_SAVE_DELAY_MS = 500L
-        private const val ABANDON_FOCUS_TIMEOUT_MS = 5000L // 5 seconds
         private const val AUTO_STOP_PAUSE_TIMEOUT_MS = 10 * 60 * 1000L // 10 minutes
     }
 }

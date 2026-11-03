@@ -74,6 +74,12 @@ class SystemTtsEngine(
 
         textToSpeech = TextToSpeech(appContext, { status ->
             if (status == TextToSpeech.SUCCESS) {
+                val audioAttributes = android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+                textToSpeech?.setAudioAttributes(audioAttributes)
+
                 configureProgressListener()
                 _engineState.value = EngineState.Ready
 
@@ -243,6 +249,10 @@ class SystemTtsEngine(
             // Silent warm-up utterance with narrator voice
             tts.playSilentUtterance(50, TextToSpeech.QUEUE_FLUSH, "warmup_silent_${System.currentTimeMillis()}")
         } catch (_: Exception) {}
+    }
+
+    fun setAudioAttributes(attributes: android.media.AudioAttributes) {
+        textToSpeech?.setAudioAttributes(attributes)
     }
 
     override fun release() {

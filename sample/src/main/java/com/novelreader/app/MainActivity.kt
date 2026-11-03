@@ -31,9 +31,11 @@ import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Warning
+import com.novelreader.tts.android.service.AudioFocusMode
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -175,7 +177,7 @@ class MainActivity : ComponentActivity() {
                                     action = TtsPlaybackService.ACTION_START_FOREGROUND
                                 }
                                 ContextCompat.startForegroundService(this@MainActivity, startIntent)
-                                binder.controller.play()
+                                binder.play()
                             }
                         )
                     } else {
@@ -255,6 +257,22 @@ fun MainAppScaffold(
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotificationPermission) {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
+    }
+
+    var showSettingsSheet by remember { mutableStateOf(false) }
+
+    var audioFocusMode by remember {
+        val saved = prefs.getString("audio_focus_mode", AudioFocusMode.PAUSE_OTHERS.name)
+            ?: AudioFocusMode.PAUSE_OTHERS.name
+        mutableStateOf(try { AudioFocusMode.valueOf(saved) } catch (_: Exception) { AudioFocusMode.PAUSE_OTHERS })
+    }
+
+    var keepReadingWhenOtherAudioStarts by remember {
+        mutableStateOf(prefs.getBoolean("keep_reading_when_other_audio_starts", false))
+    }
+
+    LaunchedEffect(serviceBinder, audioFocusMode, keepReadingWhenOtherAudioStarts) {
+        serviceBinder?.setAudioFocusSettings(audioFocusMode, keepReadingWhenOtherAudioStarts)
     }
 
     // Remember the last pasted text across restarts (empty string on fresh launch)
@@ -407,7 +425,9 @@ fun MainAppScaffold(
                     onSegmentsChange = { segments = it },
                     onLoadChapter = { processAndLoadChapter(it) },
                     onPlayClicked = onPlayClicked,
+                    onPauseClicked = { serviceBinder?.pause() ?: controller.pause() },
                     onOpenCastScreen = { selectedTab = 1 },
+                    onOpenSettings = { showSettingsSheet = true },
                     hasNotificationPermission = hasNotificationPermission,
                     resumedFromSentence = resumedFromSentence,
                     onRestartFromBeginning = {
@@ -440,6 +460,136 @@ fun MainAppScaffold(
                 )
             }
         }
+
+        if (showSettingsSheet) {
+            val sheetState = rememberModalBottomSheetState()
+            ModalBottomSheet(
+                onDismissRequest = { showSettingsSheet = false },
+                sheetState = sheetState
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp, vertical = 12.dp)
+                ) {
+                    Text(
+                        text = "Audio Focus Settings",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Text(
+                        text = "When other audio is playing",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    val modes = listOf(
+                        Triple(
+                            AudioFocusMode.PAUSE_OTHERS,
+                            "Pause others (default)",
+                            "Pause other apps while reading (AUDIOFOCUS_GAIN)"
+                        ),
+                        Triple(
+                            AudioFocusMode.DUCK_OTHERS,
+                            "Duck others",
+                            "Lower other audio volume across sentences (AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)"
+                        ),
+                        Triple(
+                            AudioFocusMode.MIX,
+                            "Mix",
+                            "Play alongside other audio without requesting focus"
+                        )
+                    )
+
+                    modes.forEach { (modeOption, title, description) ->
+                        val isSelected = audioFocusMode == modeOption
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                                .clickable {
+                                    audioFocusMode = modeOption
+                                    prefs.edit().putString("audio_focus_mode", modeOption.name).apply()
+                                    serviceBinder?.setAudioFocusSettings(modeOption, keepReadingWhenOtherAudioStarts)
+                                },
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                            )
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = title,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold
+                                    )
+                                    Text(
+                                        text = description,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.secondary
+                                    )
+                                }
+                                if (isSelected) {
+                                    Icon(
+                                        Icons.Default.Check,
+                                        contentDescription = "Selected",
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Keep reading when other audio starts",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = "Ignore focus loss from other apps. Always pauses for phone calls and ringtones.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.secondary
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Switch(
+                                checked = keepReadingWhenOtherAudioStarts,
+                                onCheckedChange = { checked ->
+                                    keepReadingWhenOtherAudioStarts = checked
+                                    prefs.edit().putBoolean("keep_reading_when_other_audio_starts", checked).apply()
+                                    serviceBinder?.setAudioFocusSettings(audioFocusMode, checked)
+                                }
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(24.dp))
+                }
+            }
+        }
     }
 }
 
@@ -457,7 +607,9 @@ fun ReaderTabContent(
     onSegmentsChange: (List<Segment>) -> Unit,
     onLoadChapter: (String) -> Unit,
     onPlayClicked: () -> Unit,
+    onPauseClicked: () -> Unit = {},
     onOpenCastScreen: () -> Unit,
+    onOpenSettings: () -> Unit = {},
     hasNotificationPermission: Boolean = true,
     resumedFromSentence: Int? = null,
     onRestartFromBeginning: () -> Unit = {}
@@ -496,20 +648,28 @@ fun ReaderTabContent(
                 )
             }
 
-            // Current Speaker Chip
-            readerState.currentSpeaker?.let { speaker ->
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(MaterialTheme.colorScheme.primaryContainer)
-                        .padding(horizontal = 12.dp, vertical = 6.dp)
-                ) {
-                    Text(
-                        text = "Speaker: ${speaker.displayName}",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        fontWeight = FontWeight.SemiBold
-                    )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                // Current Speaker Chip
+                readerState.currentSpeaker?.let { speaker ->
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(MaterialTheme.colorScheme.primaryContainer)
+                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Text(
+                            text = "Speaker: ${speaker.displayName}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.width(4.dp))
+
+                IconButton(onClick = onOpenSettings) {
+                    Icon(Icons.Default.Settings, contentDescription = "Settings")
                 }
             }
         }
@@ -617,7 +777,7 @@ fun ReaderTabContent(
 
         Spacer(modifier = Modifier.height(6.dp))
 
-        // Action Buttons Row (Only "Load" and "Cast", no sample button)
+        // Action Buttons Row
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -633,6 +793,12 @@ fun ReaderTabContent(
                 Icon(Icons.Default.Group, contentDescription = "Cast", modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(4.dp))
                 Text("Cast")
+            }
+
+            FilledTonalButton(onClick = onOpenSettings) {
+                Icon(Icons.Default.Settings, contentDescription = "Settings", modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Settings")
             }
         }
 
@@ -803,7 +969,7 @@ fun ReaderTabContent(
             FloatingActionButton(
                 onClick = {
                     if (readerState.isPlaying) {
-                        controller.pause()
+                        onPauseClicked()
                     } else {
                         onPlayClicked()
                     }
