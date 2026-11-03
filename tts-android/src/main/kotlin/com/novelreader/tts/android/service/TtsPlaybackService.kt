@@ -180,35 +180,35 @@ class TtsPlaybackService : Service() {
     }
 
     private fun setupMediaSession() {
-        mediaSession = MediaSessionCompat(this, MEDIA_SESSION_TAG).apply {
-            setCallback(object : MediaSessionCompat.Callback() {
-                override fun onPlay() {
-                    if (audioFocusStateMachine.onPlayRequested()) {
-                        controller.play()
-                    }
+        val session = MediaSessionCompat(this, MEDIA_SESSION_TAG)
+        session.setCallback(object : MediaSessionCompat.Callback() {
+            override fun onPlay() {
+                if (audioFocusStateMachine.onPlayRequested()) {
+                    this@TtsPlaybackService.controller.play()
                 }
+            }
 
-                override fun onPause() {
-                    audioFocusStateMachine.onPauseRequested()
-                    controller.pause()
-                }
+            override fun onPause() {
+                audioFocusStateMachine.onPauseRequested()
+                this@TtsPlaybackService.controller.pause()
+            }
 
-                override fun onSkipToNext() {
-                    controller.next()
-                }
+            override fun onSkipToNext() {
+                this@TtsPlaybackService.controller.next()
+            }
 
-                override fun onSkipToPrevious() {
-                    controller.previous()
-                }
+            override fun onSkipToPrevious() {
+                this@TtsPlaybackService.controller.previous()
+            }
 
-                override fun onStop() {
-                    audioFocusStateMachine.onStopRequested()
-                    controller.stop()
-                    stopForegroundAndSelf()
-                }
-            })
-            isActive = true
-        }
+            override fun onStop() {
+                audioFocusStateMachine.onStopRequested()
+                this@TtsPlaybackService.controller.stop()
+                stopForegroundAndSelf()
+            }
+        })
+        session.isActive = true
+        mediaSession = session
     }
 
     fun setAudioFocusSettings(mode: AudioFocusMode, keepReading: Boolean) {
@@ -243,11 +243,11 @@ class TtsPlaybackService : Service() {
         audioFocusStateMachine = TtsAudioFocusStateMachine(
             callback = object : TtsFocusCallback {
                 override fun onPausePlayback() {
-                    controller.pause()
+                    this@TtsPlaybackService.controller.pause()
                 }
 
                 override fun onResumePlayback() {
-                    controller.play()
+                    this@TtsPlaybackService.controller.play()
                 }
 
                 override fun onRequestSystemFocus(focusGain: Int): Boolean {
