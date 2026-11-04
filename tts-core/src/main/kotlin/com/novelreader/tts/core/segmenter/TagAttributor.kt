@@ -17,8 +17,14 @@ data class AttributionResult(
 /**
  * Pure Kotlin, rule-based dialogue tag attribution without LLM dependencies.
  *
- * Scans context immediately following and preceding dialogue segments for dialogue tags
- * like `"...," said Name` and `Name said, "..."`.
+ * Implements a two-pass algorithm:
+ * - Pass 1: Scans the chapter across ALL patterns (speech tags, same-paragraph continuation, action beats)
+ *   to collect candidate names and occurrences, marking names "confirmed" if:
+ *   (a) they appear in any strong pattern (speech verb adjacent to quote),
+ *   (b) they match an existing character name or alias, or
+ *   (c) they appear at least twice anywhere in the chapter.
+ * - Pass 2: Assigns speakers using only confirmed names following priority order:
+ *   manual override > explicit speech-verb tag > same-paragraph continuation > action beat > Unnamed.
  */
 class TagAttributor(
     verbs: List<String> = DEFAULT_VERBS,
@@ -33,45 +39,27 @@ class TagAttributor(
         .joinToString("|") { Regex.escape(it) }
 
     // Pattern 1a: after quote - `," said Lin`, `," asked Xian`, `," whispered Chen Yu`, `," called back Xian`
-    // (?i) applied only to the verb part, NOT to the candidate name part.
+    // Particle/adverb following verb must be strictly lowercase letters \p{Ll} so it never swallows capitalized names like Chen
     private val postSaidNameRegex = Regex(
-        """^\s*[,—–-]?\s*(?i:$verbsPattern)(?:\s+(?i:(?!to\b)[a-z]+))?\s+([\p{L}]+(?:\s+[\p{L}]+){0,3})(?:\s+(?i:to)\s+[\p{L}]+(?:\s+[\p{L}]+)*)?\b"""
+        """^\s*[,—–-]?\s*(?:$verbsPattern)(?:\s+(?!(?:to|said)\b)[\p{Ll}]+)?\s+([\p{L}]+(?:\s+[\p{L}]+){0,3})(?:\s+[tT][oO]\s+[\p{L}]+(?:\s+[\p{L}]+)*)?\b"""
     )
 
-    // Pattern 1b: after quote - `," Lin Mo said`, `," Xian called back`, `," And Xian said`
-    // (?i) applied only to the verb part, NOT to the candidate name part.
+    // Pattern 1b: after quote - `," Lin Mo said`, `," Xian called back`
     private val postNameSaidRegex = Regex(
-        """^\s*[,—–-]?\s*([\p{L}]+(?:\s+[\p{L}]+){0,3})\s+(?i:$verbsPattern)(?:\s+(?i:(?!to\b)[a-z]+))?(?:\s+(?i:to)\s+[\p{L}]+(?:\s+[\p{L}]+)*)?\b"""
+        """^\s*[,—–-]?\s*([\p{L}]+(?:\s+[\p{L}]+){0,3})\s+(?:$verbsPattern)(?:\s+(?!(?:to|said)\b)[\p{Ll}]+)?(?:\s+[tT][oO]\s+[\p{L}]+(?:\s+[\p{L}]+)*)?\b"""
     )
 
     // Pattern 2: before quote - `Lin Mo said, "..."` or `And Xian said: "..."`
-    // (?i) applied only to the verb part, NOT to the candidate name part.
     private val preQuoteRegex = Regex(
-        """([\p{L}]+(?:\s+[\p{L}]+){0,3})\s+(?i:$verbsPattern)(?:\s+(?i:(?!to\b)[a-z]+))?(?:\s+(?i:to)\s+[\p{L}]+(?:\s+[\p{L}]+)*)?\s*[,:]?\s*$"""
-    )
-
-    private enum class TagSource {
-        SPEECH_TAG,
-        CONTINUATION,
-        ACTION_BEAT
-    }
-
-    private data class CandidateInfo(
-        val name: String,
-        val source: TagSource,
-        val hasSpeechVerb: Boolean
+        """([\p{L}]+(?:\s+[\p{L}]+){0,3})\s+(?:$verbsPattern)(?:\s+(?!(?:to|said)\b)[\p{Ll}]+)?(?:\s+[tT][oO]\s+[\p{L}]+(?:\s+[\p{L}]+)*)?\s*[,:]?\s*$"""
     )
 
     /**
      * Attributes speakers for all dialogue segments in [segments].
      *
-     * Priority: manual override > explicit speech-verb tag > same-paragraph continuation > action beat > Unnamed.
-     * Never overwrites a higher-priority source.
-     *
-     * @param segments The list of segments (from [NovelSegmenter]).
-     * @param existingCharacters Existing known characters in the book/project.
-     * @param ignoredNames Names that should not be auto-detected or assigned.
-     * @return [AttributionResult] with updated segments and any newly created characters.
+     * Two passes per chapter:
+     * - Pass 1: Collects candidate names and counts from all patterns across the chapter.
+     * - Pass 2: Assigns speakers using only confirmed names.
      */
     fun attribute(
         segments: List<Segment>,
@@ -87,33 +75,30 @@ class TagAttributor(
         }
 
         val normalizedIgnored = ignoredNames.map { it.trim().lowercase() }.toSet()
-        val candidates = Array<CandidateInfo?>(segments.size) { null }
-
-        // Compute paragraph indices for all segments based on newline boundaries
         val paragraphIndices = computeParagraphIndices(segments)
 
         // -------------------------------------------------------------------------
-        // Priority 1: Explicit speech-verb tag (Pattern 1a, 1b, Pattern 2)
+        // PASS 1: Collect candidate names and counts from ALL patterns across the chapter
         // -------------------------------------------------------------------------
+        val speechCandidates = Array<String?>(segments.size) { null }
+        val continuationCandidates = Array<String?>(segments.size) { null }
+        val actionBeatCandidates = Array<String?>(segments.size) { null }
+
+        val strongNames = mutableSetOf<String>()
+        val candidateCounts = mutableMapOf<String, Int>()
+
+        // 1. Explicit speech-verb tags (Pattern 1a, 1b, Pattern 2) - Strong Patterns
         for (i in segments.indices) {
             if (segments[i].type == SegmentType.DIALOGUE) {
                 val candidateName = findSpeakerCandidate(segments, i)
                 if (candidateName != null && !normalizedIgnored.contains(candidateName.trim().lowercase())) {
-                    candidates[i] = CandidateInfo(
-                        name = candidateName,
-                        source = TagSource.SPEECH_TAG,
-                        hasSpeechVerb = true
-                    )
+                    speechCandidates[i] = candidateName
+                    strongNames.add(candidateName.trim().lowercase())
                 }
             }
         }
 
-        // -------------------------------------------------------------------------
-        // Priority 2: Same-paragraph continuation
-        // If a paragraph contains exactly one distinct named speaker (from a speech-verb tag),
-        // every other untagged dialogue segment in that same paragraph gets that speaker.
-        // If the paragraph has two different named speakers, leave untagged ones Unnamed.
-        // -------------------------------------------------------------------------
+        // 2. Same-paragraph continuation (Weak Pattern)
         val dialogueIndicesByPara = segments.indices
             .filter { segments[it].type == SegmentType.DIALOGUE }
             .groupBy { paragraphIndices[it] }
@@ -122,18 +107,14 @@ class TagAttributor(
 
         for ((paraIndex, dIndices) in dialogueIndicesByPara) {
             val speechTagSpeakers = dIndices
-                .mapNotNull { idx -> candidates[idx]?.takeIf { it.source == TagSource.SPEECH_TAG }?.name }
+                .mapNotNull { speechCandidates[it] }
                 .distinctBy { it.lowercase() }
 
             if (speechTagSpeakers.size == 1) {
                 val singleSpeakerName = speechTagSpeakers.first()
                 for (idx in dIndices) {
-                    if (candidates[idx] == null) {
-                        candidates[idx] = CandidateInfo(
-                            name = singleSpeakerName,
-                            source = TagSource.CONTINUATION,
-                            hasSpeechVerb = false
-                        )
+                    if (speechCandidates[idx] == null) {
+                        continuationCandidates[idx] = singleSpeakerName
                     }
                 }
             } else if (speechTagSpeakers.size > 1) {
@@ -141,71 +122,73 @@ class TagAttributor(
             }
         }
 
-        // -------------------------------------------------------------------------
-        // Priority 3: Action beat
-        // If the sentence immediately before a quote (same paragraph) starts with a
-        // capitalized name (1 to 3 words, or a name matching an existing character or alias)
-        // followed by a verb, and the quote has no tag of its own, assign that name.
-        // -------------------------------------------------------------------------
+        // 3. Action beats (Weak Pattern)
         for (i in segments.indices) {
-            if (segments[i].type == SegmentType.DIALOGUE && candidates[i] == null) {
+            if (segments[i].type == SegmentType.DIALOGUE && speechCandidates[i] == null && continuationCandidates[i] == null) {
                 val para = paragraphIndices[i]
                 if (!parasWithConflictingSpeakers.contains(para)) {
                     val candidateName = findActionBeatCandidate(segments, i, characterList, normalizedIgnored)
                     if (candidateName != null) {
-                        candidates[i] = CandidateInfo(
-                            name = candidateName,
-                            source = TagSource.ACTION_BEAT,
-                            hasSpeechVerb = false
-                        )
+                        actionBeatCandidates[i] = candidateName
                     }
                 }
             }
         }
 
-        // -------------------------------------------------------------------------
-        // Priority 4: Confirmation Threshold & Character Creation
-        // A new name is only created as a Character after it is attributed at least
-        // twice in the same chapter, OR once if it matches an existing character name
-        // or alias, OR if it appears in the strong pattern '"..." said Name' with a speech verb.
-        // Otherwise leave the segment as Unnamed and don't create anything.
-        // -------------------------------------------------------------------------
-        val candidateCounts = mutableMapOf<String, Int>()
-        for (c in candidates) {
-            if (c != null) {
-                val key = c.name.lowercase()
-                candidateCounts[key] = (candidateCounts[key] ?: 0) + 1
+        // 4. Count candidate occurrences across the chapter
+        for (i in segments.indices) {
+            if (segments[i].type == SegmentType.DIALOGUE) {
+                val cand = speechCandidates[i] ?: continuationCandidates[i] ?: actionBeatCandidates[i]
+                if (cand != null) {
+                    val key = cand.trim().lowercase()
+                    candidateCounts[key] = (candidateCounts[key] ?: 0) + 1
+                }
             }
         }
 
+        // A candidate is marked "confirmed" if:
+        // (a) it appears in any strong pattern (speech verb adjacent to quote),
+        // (b) it matches an existing character name or alias, or
+        // (c) it is seen at least twice anywhere in the chapter.
         fun isCandidateConfirmed(name: String): Boolean {
-            // 1. Matches an existing character name or alias
-            if (characterList.any { it.matchesName(name) && !it.isBuiltIn }) {
+            val lower = name.trim().lowercase()
+            if (strongNames.contains(lower)) {
                 return true
             }
-            // 2. Appears in strong pattern with a speech verb
-            val hasSpeechVerb = candidates.any {
-                it != null && it.name.equals(name, ignoreCase = true) && it.hasSpeechVerb
-            }
-            if (hasSpeechVerb) {
+            if (characterList.any { !it.isBuiltIn && it.matchesName(name) }) {
                 return true
             }
-            // 3. Attributed at least twice in the same chapter
-            val count = candidateCounts[name.lowercase()] ?: 0
+            val count = candidateCounts[lower] ?: 0
             if (count >= 2) {
                 return true
             }
             return false
         }
 
+        // -------------------------------------------------------------------------
+        // PASS 2: Assign dialogue speakers using only confirmed names
+        // Weak patterns (action beat, same-paragraph continuation) assign only confirmed names.
+        // -------------------------------------------------------------------------
         val assignedSpeakerIds = Array<String?>(segments.size) { null }
         for (i in segments.indices) {
-            val cand = candidates[i]
-            if (cand != null && isCandidateConfirmed(cand.name)) {
-                val resolvedChar = resolveOrCreate(cand.name, characterList)
-                assignedSpeakerIds[i] = resolvedChar.id
-            } else {
-                assignedSpeakerIds[i] = null
+            if (segments[i].type == SegmentType.DIALOGUE) {
+                val speechName = speechCandidates[i]
+                val contName = continuationCandidates[i]
+                val actionName = actionBeatCandidates[i]
+
+                val resolvedName: String? = when {
+                    speechName != null -> speechName // Strong pattern: confirmed by rule (a)
+                    contName != null && isCandidateConfirmed(contName) -> contName // Weak pattern
+                    actionName != null && isCandidateConfirmed(actionName) -> actionName // Weak pattern
+                    else -> null
+                }
+
+                if (resolvedName != null) {
+                    val resolvedChar = resolveOrCreate(resolvedName, characterList)
+                    assignedSpeakerIds[i] = resolvedChar.id
+                } else {
+                    assignedSpeakerIds[i] = null
+                }
             }
         }
 
@@ -314,7 +297,7 @@ class TagAttributor(
         val recipient = recipientMatch?.groupValues?.get(1)?.trim()?.lowercase()
 
         // If this sentence is itself a speech-verb tag for the quote or prior dialogue, it's not an action beat
-        if (postSaidNameRegex.containsMatchIn(sentence) || postNameSaidRegex.containsMatchIn(sentence)) {
+        if (preQuoteRegex.containsMatchIn(sentence) || postSaidNameRegex.containsMatchIn(sentence) || postNameSaidRegex.containsMatchIn(sentence)) {
             return null
         }
 
@@ -337,18 +320,18 @@ class TagAttributor(
             }
         }
 
-        // 2. Match 1 to 4 words at start of sentence, validated through cleanAndValidateCandidate
-        val capMatch = Regex("""^([\p{L}]+(?:\s+[\p{L}]+){0,3})\b""").find(sentence)
-        if (capMatch != null) {
-            val rawName = capMatch.groupValues[1]
-            val validated = cleanAndValidateCandidate(rawName)
+        // 2. Candidate of 1 to 3 words at start of sentence, validated through cleanAndValidateCandidate
+        // Words in sentence (allow up to 4 raw tokens to handle sentence-initial stopwords like "And Xian")
+        val words = sentence.trim().split(Regex("""\s+""")).filter { it.isNotBlank() }
+        for (numWords in minOf(4, words.size) downTo 1) {
+            val raw = words.take(numWords).joinToString(" ")
+            val validated = cleanAndValidateCandidate(raw)
             if (validated != null) {
-                val lower = validated.lowercase()
-                if (recipient != null && lower == recipient) return null
-                if (normalizedIgnored.contains(lower)) return null
-
-                val remainder = sentence.substring(capMatch.range.last + 1).trimStart()
+                val remainder = words.drop(numWords).joinToString(" ")
                 if (isFollowedByVerb(remainder)) {
+                    val lower = validated.lowercase()
+                    if (recipient != null && lower == recipient) continue
+                    if (normalizedIgnored.contains(lower)) continue
                     return validated
                 }
             }

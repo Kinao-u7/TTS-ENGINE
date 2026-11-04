@@ -231,9 +231,10 @@ class TagAttributorTest {
 
     @Test
     fun `action beat with poked the embers assigns Xian`() {
-        val text = "Xian poked the embers. \"Before noon, or before the fog thickens?\"\nXian stood up. \"Answer me.\""
+        val text = "Xian poked the embers. \"Before noon, or before the fog thickens?\""
         val segments = NovelSegmenter.segment(text)
-        val result = attributor.attribute(segments)
+        val existingXian = Character(id = "char_xian", name = "Xian")
+        val result = attributor.attribute(segments, listOf(existingXian))
         val dialogue = result.segments.first { it.type == SegmentType.DIALOGUE }
 
         val xianChar = result.characters.firstOrNull { it.name == "Xian" }
@@ -244,15 +245,28 @@ class TagAttributorTest {
 
     @Test
     fun `action beat with laughed assigns Xian`() {
-        val text = "Xian laughed. \"You say that about everyone.\"\nXian grinned. \"Even yourself.\""
+        val text = "Xian laughed. \"You say that about everyone.\""
         val segments = NovelSegmenter.segment(text)
-        val result = attributor.attribute(segments)
+        val existingXian = Character(id = "char_xian", name = "Xian")
+        val result = attributor.attribute(segments, listOf(existingXian))
         val dialogue = result.segments.first { it.type == SegmentType.DIALOGUE }
 
         val xianChar = result.characters.firstOrNull { it.name == "Xian" }
         assertNotNull(xianChar)
         assertEquals(xianChar?.id, dialogue.speakerId)
         assertEquals(xianChar?.id, dialogue.effectiveSpeakerId)
+    }
+
+    @Test
+    fun `unconfirmed single action beat creates nothing and dialogue stays unnamed`() {
+        val text = "Xian poked the embers. \"Before noon, or before the fog thickens?\""
+        val segments = NovelSegmenter.segment(text)
+        val result = attributor.attribute(segments)
+        val dialogue = result.segments.first { it.type == SegmentType.DIALOGUE }
+
+        assertNull(dialogue.speakerId)
+        assertEquals(Character.UNNAMED_ID, dialogue.effectiveSpeakerId)
+        assertNull(result.characters.firstOrNull { it.name == "Xian" })
     }
 
     @Test
