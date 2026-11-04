@@ -85,11 +85,16 @@ class PlaybackController(
     )
     private var availableVoices: List<VoiceInfo> = emptyList()
     private var globalSpeed: Float? = null
+    private var currentBookLocale: String = bookLocale
 
     private var currentSentenceIndex: Int = 0
     private var nextToEnqueueIndex: Int = 0
     private var playRequestedWhenReady: Boolean = false
 
+    private var playbackGeneration: Long = 0L
+    val currentGeneration: Long get() = playbackGeneration
+
+    private val validUtteranceIds = mutableSetOf<String>()
     private val utteranceVoiceNames = mutableMapOf<String, String>()
 
     private var eventCollectorJob: Job? = null
@@ -98,6 +103,16 @@ class PlaybackController(
     init {
         availableVoices = speechEngine.getAvailableVoices()
         startListeningToEngine()
+    }
+
+    private fun bumpGeneration() {
+        playbackGeneration++
+        validUtteranceIds.clear()
+        utteranceVoiceNames.clear()
+    }
+
+    fun setBookLocale(locale: String) {
+        currentBookLocale = locale
     }
 
     private fun startListeningToEngine() {
@@ -125,6 +140,7 @@ class PlaybackController(
      * Blank or whitespace-only segments and sentences are automatically skipped.
      */
     fun loadSegments(newSegments: List<Segment>, initialSentenceIndex: Int = 0) {
+        bumpGeneration()
         speechEngine.stop()
         segments = newSegments
         sentences = splitSegmentsIntoSentences(newSegments)
@@ -132,7 +148,6 @@ class PlaybackController(
         currentSentenceIndex = initialSentenceIndex.coerceIn(0, (sentences.size - 1).coerceAtLeast(0))
         nextToEnqueueIndex = currentSentenceIndex
         playRequestedWhenReady = false
-        utteranceVoiceNames.clear()
 
         updateReaderState(isPlaying = false)
         _state.value = if (sentences.isNotEmpty()) PlaybackState.Idle else PlaybackState.Stopped
@@ -204,6 +219,7 @@ class PlaybackController(
         if (!_readerState.value.isPlaying && !playRequestedWhenReady) return
 
         playRequestedWhenReady = false
+        bumpGeneration()
         speechEngine.stop()
         nextToEnqueueIndex = currentSentenceIndex
 
@@ -234,6 +250,7 @@ class PlaybackController(
      */
     fun stop() {
         playRequestedWhenReady = false
+        bumpGeneration()
         speechEngine.stop()
         nextToEnqueueIndex = currentSentenceIndex
 
@@ -264,6 +281,7 @@ class PlaybackController(
         val boundedIndex = targetIndex.coerceIn(0, sentences.size - 1)
         val wasPlaying = _readerState.value.isPlaying || playRequestedWhenReady
 
+        bumpGeneration()
         speechEngine.stop()
         currentSentenceIndex = boundedIndex
         nextToEnqueueIndex = currentSentenceIndex
@@ -316,7 +334,8 @@ class PlaybackController(
         val isCurrentlyPlaying = currentlyPlayingSentence?.segmentId == segmentId
 
         if (isCurrentlyPlaying && _readerState.value.isPlaying) {
-            // Stop, drop queued sentences, and restart from this segment
+            // Stop, drop queued sentences, bump generation, and restart from this segment
+            bumpGeneration()
             speechEngine.stop()
             val segmentStartIndex = sentences.indexOfFirst { it.segmentId == segmentId }
             if (segmentStartIndex >= 0) {
@@ -327,21 +346,13 @@ class PlaybackController(
     }
 
     /**
-     * Fills the lookahead queue: always keeps at least [lookaheadCount] sentences enqueued ahead.
+     * Fills the lookahead queue: refills only to currentSentenceIndex + 1 + lookahead.
      */
     private fun fillLookaheadQueue() {
         if (!_readerState.value.isPlaying || sentences.isEmpty()) return
 
         val targetCount = minOf(sentences.size, currentSentenceIndex + 1 + lookaheadCount)
         while (nextToEnqueueIndex < targetCount) {
-            enqueueSentence(sentences[nextToEnqueueIndex])
-            nextToEnqueueIndex++
-        }
-    }
-
-    private fun refillNext() {
-        if (!_readerState.value.isPlaying || sentences.isEmpty()) return
-        if (nextToEnqueueIndex < sentences.size) {
             enqueueSentence(sentences[nextToEnqueueIndex])
             nextToEnqueueIndex++
         }
@@ -359,7 +370,7 @@ class PlaybackController(
             character = speaker,
             availableVoices = availableVoices,
             usedVoices = usedVoiceIds,
-            bookLocale = bookLocale,
+            bookLocale = currentBookLocale,
             narratorVoiceId = narratorVoiceId
         )
 
@@ -369,7 +380,8 @@ class PlaybackController(
 
         // Settings come only from getSettings(character)
         val settings = VoiceSettings.getSettings(speaker, globalSpeed)
-        val utteranceId = makeUtteranceId(sentence.index, sentence.segmentId)
+        val utteranceId = makeUtteranceId(playbackGeneration, sentence.index, sentence.segmentId)
+        validUtteranceIds.add(utteranceId)
 
         val voiceName = voiceResult.voice?.name ?: voiceResult.voice?.id ?: "System Default"
         utteranceVoiceNames[utteranceId] = voiceName
@@ -383,6 +395,22 @@ class PlaybackController(
     }
 
     private fun handleSpeechEvent(event: SpeechEvent) {
+        val utteranceId = when (event) {
+            is SpeechEvent.Started -> event.utteranceId
+            is SpeechEvent.Range -> event.utteranceId
+            is SpeechEvent.Done -> event.utteranceId
+            is SpeechEvent.Error -> event.utteranceId
+        }
+
+        // Ignore events not in the current generation or valid utterance IDs
+        if (utteranceId !in validUtteranceIds) {
+            return
+        }
+        val gen = parseGeneration(utteranceId)
+        if (gen != null && gen != playbackGeneration) {
+            return
+        }
+
         when (event) {
             is SpeechEvent.Started -> {
                 val sentenceIndex = parseSentenceIndex(event.utteranceId) ?: return
@@ -409,8 +437,8 @@ class PlaybackController(
                     rangeInSegment = sentence?.let { TextRange(it.sentenceStartInSegment, it.sentenceEndInSegment) }
                 )
 
-                // Refill queue on onStart of earlier utterances without waiting for completion
-                refillNext()
+                // Call fillLookaheadQueue on Started to refill only to currentSentenceIndex + 1 + lookahead
+                fillLookaheadQueue()
             }
 
             is SpeechEvent.Range -> {
@@ -440,10 +468,8 @@ class PlaybackController(
                     // Reached end of chapter
                     updateReaderState(isPlaying = false, clearSentenceHighlight = true, clearWordHighlight = true)
                     _state.value = PlaybackState.Stopped
-                } else {
-                    // Refill queue on onDone of earlier utterances
-                    refillNext()
                 }
+                // Do NOT refill on Done!
             }
 
             is SpeechEvent.Error -> {
@@ -535,14 +561,25 @@ class PlaybackController(
         return result
     }
 
-    private fun makeUtteranceId(index: Int, segmentId: String): String {
-        return "utt_${index}_${segmentId}_${System.nanoTime()}"
+    private fun makeUtteranceId(generation: Long, index: Int, segmentId: String): String {
+        return "utt_${generation}_${index}_${segmentId}_${System.nanoTime()}"
     }
 
     private fun parseSentenceIndex(utteranceId: String): Int? {
         val parts = utteranceId.split("_")
+        if (parts.size >= 3 && parts[0] == "utt") {
+            return parts[2].toIntOrNull()
+        }
         if (parts.size >= 2 && parts[0] == "utt") {
             return parts[1].toIntOrNull()
+        }
+        return null
+    }
+
+    private fun parseGeneration(utteranceId: String): Long? {
+        val parts = utteranceId.split("_")
+        if (parts.size >= 3 && parts[0] == "utt") {
+            return parts[1].toLongOrNull()
         }
         return null
     }

@@ -287,6 +287,10 @@ fun MainAppScaffold(
 
     val readerState by controller.readerState.collectAsState()
 
+    val bookLocale = remember {
+        prefs.getString("book_locale", Locale.getDefault().toLanguageTag()) ?: Locale.getDefault().toLanguageTag()
+    }
+
     // Sync characters with PlaybackController
     LaunchedEffect(charactersList) {
         if (charactersList.isNotEmpty()) {
@@ -294,12 +298,66 @@ fun MainAppScaffold(
         }
     }
 
-    // Load available voices once TTS engine is ready
+    // Load available voices once TTS engine is ready and assign distinct voices on first run
     LaunchedEffect(readerState.isReady) {
         if (readerState.isReady) {
             val deviceVoices = ttsEngine.getAvailableVoices().filter { !it.requiresNetwork }
             availableVoices = deviceVoices
             controller.updateAvailableVoices(deviceVoices)
+            controller.setBookLocale(bookLocale)
+
+            if (deviceVoices.isNotEmpty()) {
+                val currentChars = charactersList.ifEmpty {
+                    listOf(Character.Narrator, Character.Unnamed)
+                }
+
+                var narratorChar = currentChars.firstOrNull { it.id == Character.NARRATOR_ID } ?: Character.Narrator
+                var unnamedChar = currentChars.firstOrNull { it.id == Character.UNNAMED_ID } ?: Character.Unnamed
+                val usedVoiceIds = currentChars.mapNotNull { it.voiceId }.toMutableSet()
+                var needsSaveNarrator = false
+                var needsSaveUnnamed = false
+
+                if (narratorChar.voiceId == null) {
+                    val pickNarrator = VoiceSelector.pick(
+                        character = narratorChar,
+                        availableVoices = deviceVoices,
+                        usedVoices = usedVoiceIds,
+                        bookLocale = bookLocale
+                    )
+                    pickNarrator.voice?.id?.let {
+                        narratorChar = narratorChar.copy(voiceId = it)
+                        usedVoiceIds.add(it)
+                        needsSaveNarrator = true
+                    }
+                }
+
+                if (unnamedChar.voiceId == null) {
+                    val pickUnnamed = VoiceSelector.pick(
+                        character = unnamedChar,
+                        availableVoices = deviceVoices,
+                        usedVoices = usedVoiceIds,
+                        bookLocale = bookLocale,
+                        narratorVoiceId = narratorChar.voiceId
+                    )
+                    pickUnnamed.voice?.id?.let {
+                        unnamedChar = unnamedChar.copy(voiceId = it)
+                        usedVoiceIds.add(it)
+                        needsSaveUnnamed = true
+                    }
+                }
+
+                if (needsSaveNarrator) {
+                    castStore.saveCharacter(STABLE_BOOK_ID, narratorChar)
+                }
+                if (needsSaveUnnamed) {
+                    castStore.saveCharacter(STABLE_BOOK_ID, unnamedChar)
+                }
+            }
+
+            // Restore chapter text now that voices and engine are ready
+            if (chapterInputText.isNotBlank() && segments.isEmpty()) {
+                processAndLoadChapter(chapterInputText)
+            }
         }
     }
 
@@ -347,7 +405,7 @@ fun MainAppScaffold(
                             character = newChar,
                             availableVoices = availableVoices,
                             usedVoices = usedVoiceIds,
-                            bookLocale = "en-US",
+                            bookLocale = bookLocale,
                             narratorVoiceId = narratorVoiceId
                         )
                         val charWithVoice = newChar.copy(voiceId = voiceResult.voice?.id)
@@ -387,13 +445,6 @@ fun MainAppScaffold(
                     resumedFromSentence = clamped
                 }
             }
-        }
-    }
-
-    // Initial load: if user had previously pasted text, restore it
-    LaunchedEffect(Unit) {
-        if (chapterInputText.isNotBlank()) {
-            processAndLoadChapter(chapterInputText)
         }
     }
 

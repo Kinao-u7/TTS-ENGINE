@@ -84,8 +84,12 @@ class PlaybackControllerTest {
         assertEquals(5, fakeEngine.speakRecords.size)
         assertEquals("Sentence four.", fakeEngine.speakRecords[4].sentence)
 
-        // When sentence 0 emits Done -> refilling ensures sentence 5 is enqueued!
+        // When sentence 0 emits Done -> do NOT refill on Done!
         fakeEngine.emitDone(fakeEngine.speakRecords[0].utteranceId)
+        assertEquals(5, fakeEngine.speakRecords.size)
+
+        // When sentence 1 emits Started -> refilling triggers sentence 5 to be enqueued!
+        fakeEngine.emitStarted(fakeEngine.speakRecords[1].utteranceId)
         assertEquals(6, fakeEngine.speakRecords.size)
         assertEquals("Sentence five.", fakeEngine.speakRecords[5].sentence)
     }
@@ -217,5 +221,74 @@ class PlaybackControllerTest {
         assertEquals(1, engineNotReady.speakRecords.size)
         assertEquals("Hello world.", engineNotReady.speakRecords[0].sentence)
         assertTrue(testController.readerState.value.isPlaying)
+    }
+
+    @Test
+    fun `playback generation counter bumps on stop pause jump loadSegments and reassign-restart`() = runTest {
+        val segments = listOf(
+            Segment("seg_0", SegmentType.NARRATION, "Line 0.", 0, 7),
+            Segment("seg_1", SegmentType.NARRATION, "Line 1.", 7, 14),
+            Segment("seg_2", SegmentType.DIALOGUE, "\"Line 2.\"", 14, 23)
+        )
+        controller.loadSegments(segments)
+        val genAfterLoad = controller.currentGeneration
+        assertTrue(genAfterLoad > 0)
+
+        controller.play()
+        assertEquals(genAfterLoad, controller.currentGeneration)
+
+        // Pause bumps generation
+        controller.pause()
+        val genAfterPause = controller.currentGeneration
+        assertTrue(genAfterPause > genAfterLoad)
+
+        // Jump bumps generation
+        controller.jumpToSentence(1)
+        val genAfterJump = controller.currentGeneration
+        assertTrue(genAfterJump > genAfterPause)
+
+        // Stop bumps generation
+        controller.stop()
+        val genAfterStop = controller.currentGeneration
+        assertTrue(genAfterStop > genAfterJump)
+
+        // Reassign currently playing line bumps generation
+        controller.play()
+        val genBeforeReassign = controller.currentGeneration
+        controller.reassignSpeaker("seg_1", "char_elena")
+        val genAfterReassign = controller.currentGeneration
+        assertTrue(genAfterReassign > genBeforeReassign)
+    }
+
+    @Test
+    fun `ignores Started Range Done Error events for utterances from older generations`() = runTest {
+        val segments = listOf(
+            Segment("seg_0", SegmentType.NARRATION, "Line 0.", 0, 7),
+            Segment("seg_1", SegmentType.NARRATION, "Line 1.", 7, 14)
+        )
+        controller.loadSegments(segments)
+        controller.play()
+
+        val staleUtteranceId = fakeEngine.speakRecords[0].utteranceId
+
+        // Pause bumps generation and invalidates old utterance IDs
+        controller.pause()
+        assertFalse(controller.readerState.value.isPlaying)
+
+        // Stale Started event must be ignored
+        fakeEngine.emitStarted(staleUtteranceId)
+        assertFalse("Stale Started must not resume playing", controller.readerState.value.isPlaying)
+
+        // Stale Range event must be ignored
+        fakeEngine.emitRange(0, 3, staleUtteranceId)
+        assertNull("Stale Range must not update word highlight", controller.readerState.value.wordHighlight)
+
+        // Stale Done event must be ignored
+        fakeEngine.emitDone(staleUtteranceId)
+        assertFalse(controller.readerState.value.isPlaying)
+
+        // Stale Error event must be ignored
+        fakeEngine.emitError(staleUtteranceId, "Stale error", 1)
+        assertNull("Stale Error must not set missingVoiceWarning", controller.readerState.value.missingVoiceWarning)
     }
 }

@@ -357,8 +357,8 @@ class TagAttributorTest {
     }
 
     @Test
-    fun `name seen once in a weak pattern is not created and same name seen twice is`() {
-        // Seen once in action beat (weak pattern) -> not created, dialogue unnamed
+    fun `weak patterns assign only names confirmed by a strong tag or an existing character and drop seen twice rule`() {
+        // Seen once in action beat (weak pattern) without strong tag -> not created, dialogue unnamed
         val singleText = "Bob poked the embers. \"Before noon, or before the fog thickens?\""
         val singleSegments = NovelSegmenter.segment(singleText)
         val singleResult = attributor.attribute(singleSegments)
@@ -367,18 +367,64 @@ class TagAttributorTest {
         assertEquals(Character.UNNAMED_ID, singleDialogue.effectiveSpeakerId)
         assertNull(singleResult.characters.firstOrNull { it.name == "Bob" })
 
-        // Same name seen twice in action beats in same chapter -> created and assigned
-        val doubleText = "Bob poked the embers. \"Before noon, or before the fog thickens?\"\nBob laughed. \"You say that about everyone.\""
+        // Same name seen twice in action beats in same chapter without strong tag -> STILL not created (seen twice rule dropped!)
+        val doubleText = "Bob poked the embers. \"Before noon, or before the fog thickens?\"\nBob stood up. \"You say that about everyone.\""
         val doubleSegments = NovelSegmenter.segment(doubleText)
         val doubleResult = attributor.attribute(doubleSegments)
-        val dialogues = doubleResult.segments.filter { it.type == SegmentType.DIALOGUE }
-        assertEquals(2, dialogues.size)
+        val doubleDialogues = doubleResult.segments.filter { it.type == SegmentType.DIALOGUE }
+        assertEquals(2, doubleDialogues.size)
+        assertNull(doubleDialogues[0].speakerId)
+        assertNull(doubleDialogues[1].speakerId)
+        assertNull(doubleResult.characters.firstOrNull { it.name == "Bob" })
 
-        val bobChar = doubleResult.characters.firstOrNull { it.name == "Bob" }
+        // But when confirmed by a strong tag anywhere in chapter, action beat resolves!
+        val confirmedByStrongTagText = "Bob poked the embers. \"Before noon?\"\n\"I agree,\" said Bob."
+        val confirmedSegments = NovelSegmenter.segment(confirmedByStrongTagText)
+        val confirmedResult = attributor.attribute(confirmedSegments)
+        val confirmedDialogues = confirmedResult.segments.filter { it.type == SegmentType.DIALOGUE }
+        assertEquals(2, confirmedDialogues.size)
+        val bobChar = confirmedResult.characters.firstOrNull { it.name == "Bob" }
         assertNotNull(bobChar)
-        assertEquals(bobChar?.id, dialogues[0].speakerId)
-        assertEquals(bobChar?.id, dialogues[1].speakerId)
-        assertTrue(bobChar!!.autoCreated)
+        assertEquals(bobChar?.id, confirmedDialogues[0].speakerId)
+        assertEquals(bobChar?.id, confirmedDialogues[1].speakerId)
+    }
+
+    @Test
+    fun `tags do not cross paragraph breaks`() {
+        // Post-quote speech tag separated by newline paragraph break
+        val postBreakText = "\"Run.\"\nLin said."
+        val postSegments = NovelSegmenter.segment(postBreakText)
+        val postResult = attributor.attribute(postSegments)
+        val postDialogue = postResult.segments.first { it.type == SegmentType.DIALOGUE }
+        assertNull("Tag across newline must not attribute", postDialogue.speakerId)
+        assertEquals(Character.UNNAMED_ID, postDialogue.effectiveSpeakerId)
+
+        // Pre-quote speech tag separated by newline paragraph break
+        val preBreakText = "Lin said.\n\"Run.\""
+        val preSegments = NovelSegmenter.segment(preBreakText)
+        val preResult = attributor.attribute(preSegments)
+        val preDialogue = preResult.segments.first { it.type == SegmentType.DIALOGUE }
+        assertNull("Tag across newline must not attribute", preDialogue.speakerId)
+        assertEquals(Character.UNNAMED_ID, preDialogue.effectiveSpeakerId)
+    }
+
+    @Test
+    fun `trim trailing lowercase words after a name`() {
+        val text1 = "\"Hello,\" said Xian softly."
+        val result1 = attributor.attribute(NovelSegmenter.segment(text1))
+        val dialogue1 = result1.segments.first { it.type == SegmentType.DIALOGUE }
+        val xianChar = result1.characters.firstOrNull { it.name == "Xian" }
+        assertNotNull(xianChar)
+        assertEquals(xianChar?.id, dialogue1.speakerId)
+        assertEquals("Xian", xianChar?.name)
+
+        val text2 = "\"Quiet,\" whispered Chen Yu looking back."
+        val result2 = attributor.attribute(NovelSegmenter.segment(text2))
+        val dialogue2 = result2.segments.first { it.type == SegmentType.DIALOGUE }
+        val chenYuChar = result2.characters.firstOrNull { it.name == "Chen Yu" }
+        assertNotNull(chenYuChar)
+        assertEquals(chenYuChar?.id, dialogue2.speakerId)
+        assertEquals("Chen Yu", chenYuChar?.name)
     }
 
     @Test

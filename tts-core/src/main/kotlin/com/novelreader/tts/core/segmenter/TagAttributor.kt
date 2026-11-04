@@ -19,12 +19,16 @@ data class AttributionResult(
  *
  * Implements a two-pass algorithm:
  * - Pass 1: Scans the chapter across ALL patterns (speech tags, same-paragraph continuation, action beats)
- *   to collect candidate names and occurrences, marking names "confirmed" if:
- *   (a) they appear in any strong pattern (speech verb adjacent to quote),
- *   (b) they match an existing character name or alias, or
- *   (c) they appear at least twice anywhere in the chapter.
+ *   to collect candidate names, marking names "confirmed" if:
+ *   (a) they appear in any strong pattern (speech verb adjacent to quote in same paragraph), or
+ *   (b) they match an existing character name or alias.
  * - Pass 2: Assigns speakers using only confirmed names following priority order:
  *   manual override > explicit speech-verb tag > same-paragraph continuation > action beat > Unnamed.
+ *
+ * Rules:
+ * - Tags do not cross paragraph breaks.
+ * - Trims trailing lowercase words after a name (e.g. "said Xian softly" -> "Xian").
+ * - Weak patterns assign only confirmed names.
  */
 class TagAttributor(
     verbs: List<String> = DEFAULT_VERBS,
@@ -58,7 +62,7 @@ class TagAttributor(
      * Attributes speakers for all dialogue segments in [segments].
      *
      * Two passes per chapter:
-     * - Pass 1: Collects candidate names and counts from all patterns across the chapter.
+     * - Pass 1: Collects candidate names from all patterns across the chapter and confirms those with strong tags or existing characters.
      * - Pass 2: Assigns speakers using only confirmed names.
      */
     fun attribute(
@@ -78,14 +82,13 @@ class TagAttributor(
         val paragraphIndices = computeParagraphIndices(segments)
 
         // -------------------------------------------------------------------------
-        // PASS 1: Collect candidate names and counts from ALL patterns across the chapter
+        // PASS 1: Collect candidate names from ALL patterns across the chapter
         // -------------------------------------------------------------------------
         val speechCandidates = Array<String?>(segments.size) { null }
         val continuationCandidates = Array<String?>(segments.size) { null }
         val actionBeatCandidates = Array<String?>(segments.size) { null }
 
         val strongNames = mutableSetOf<String>()
-        val candidateCounts = mutableMapOf<String, Int>()
 
         // 1. Explicit speech-verb tags (Pattern 1a, 1b, Pattern 2) - Strong Patterns
         for (i in segments.indices) {
@@ -135,31 +138,15 @@ class TagAttributor(
             }
         }
 
-        // 4. Count candidate occurrences across the chapter
-        for (i in segments.indices) {
-            if (segments[i].type == SegmentType.DIALOGUE) {
-                val cand = speechCandidates[i] ?: continuationCandidates[i] ?: actionBeatCandidates[i]
-                if (cand != null) {
-                    val key = cand.trim().lowercase()
-                    candidateCounts[key] = (candidateCounts[key] ?: 0) + 1
-                }
-            }
-        }
-
         // A candidate is marked "confirmed" if:
-        // (a) it appears in any strong pattern (speech verb adjacent to quote),
-        // (b) it matches an existing character name or alias, or
-        // (c) it is seen at least twice anywhere in the chapter.
+        // (a) it appears in any strong pattern (speech verb adjacent to quote), or
+        // (b) it matches an existing character name or alias.
         fun isCandidateConfirmed(name: String): Boolean {
             val lower = name.trim().lowercase()
             if (strongNames.contains(lower)) {
                 return true
             }
             if (characterList.any { !it.isBuiltIn && it.matchesName(name) }) {
-                return true
-            }
-            val count = candidateCounts[lower] ?: 0
-            if (count >= 2) {
                 return true
             }
             return false
@@ -234,39 +221,44 @@ class TagAttributor(
 
     private fun findSpeakerCandidate(segments: List<Segment>, dialogueIndex: Int): String? {
         // 1. Check text immediately after the quote (narration at dialogueIndex + 1)
+        // Tags must not cross paragraph breaks: inspect text before any newline
         if (dialogueIndex + 1 < segments.size) {
             val nextSeg = segments[dialogueIndex + 1]
             if (nextSeg.type == SegmentType.NARRATION) {
-                val nextText = nextSeg.text
+                val nextText = nextSeg.text.substringBefore('\n').substringBefore('\r')
+                if (nextText.isNotBlank()) {
+                    // Pattern 1a: `said Name`
+                    val matchSaidName = postSaidNameRegex.find(nextText)
+                    if (matchSaidName != null) {
+                        val raw = matchSaidName.groupValues[1]
+                        val validated = cleanAndValidateCandidate(raw)
+                        if (validated != null) return validated
+                    }
 
-                // Pattern 1a: `said Name`
-                val matchSaidName = postSaidNameRegex.find(nextText)
-                if (matchSaidName != null) {
-                    val raw = matchSaidName.groupValues[1]
-                    val validated = cleanAndValidateCandidate(raw)
-                    if (validated != null) return validated
-                }
-
-                // Pattern 1b: `Name said`
-                val matchNameSaid = postNameSaidRegex.find(nextText)
-                if (matchNameSaid != null) {
-                    val raw = matchNameSaid.groupValues[1]
-                    val validated = cleanAndValidateCandidate(raw)
-                    if (validated != null) return validated
+                    // Pattern 1b: `Name said`
+                    val matchNameSaid = postNameSaidRegex.find(nextText)
+                    if (matchNameSaid != null) {
+                        val raw = matchNameSaid.groupValues[1]
+                        val validated = cleanAndValidateCandidate(raw)
+                        if (validated != null) return validated
+                    }
                 }
             }
         }
 
         // 2. Check text immediately before the quote (narration at dialogueIndex - 1)
+        // Tags must not cross paragraph breaks: inspect text after the last newline
         if (dialogueIndex > 0) {
             val prevSeg = segments[dialogueIndex - 1]
             if (prevSeg.type == SegmentType.NARRATION) {
-                val prevText = prevSeg.text
-                val matchPre = preQuoteRegex.find(prevText)
-                if (matchPre != null) {
-                    val raw = matchPre.groupValues[1]
-                    val validated = cleanAndValidateCandidate(raw)
-                    if (validated != null) return validated
+                val prevText = prevSeg.text.substringAfterLast('\n').substringAfterLast('\r')
+                if (prevText.isNotBlank()) {
+                    val matchPre = preQuoteRegex.find(prevText)
+                    if (matchPre != null) {
+                        val raw = matchPre.groupValues[1]
+                        val validated = cleanAndValidateCandidate(raw)
+                        if (validated != null) return validated
+                    }
                 }
             }
         }
@@ -369,23 +361,26 @@ class TagAttributor(
     /**
      * Cleans and validates a candidate name string according to all rules:
      * 1. Multi-word: accepts up to 3 capitalized tokens.
-     * 2. Strips leading and trailing stopwords before validating (e.g. "And Xian" -> "Xian").
-     * 3. Rejects if any remaining token is in the stoplist.
-     * 4. Rejects single-token candidates of two or fewer letters.
-     * 5. Case-sensitive: each token must start with an uppercase letter followed by lowercase letters (Unicode-aware).
+     * 2. Strips leading stopwords (e.g. "And Xian" -> "Xian").
+     * 3. Trims trailing lowercase words after a name (e.g. "Xian softly" -> "Xian").
+     * 4. Rejects if any remaining token is in the stoplist.
+     * 5. Rejects single-token candidates of two or fewer letters.
+     * 6. Case-sensitive: each token must start with an uppercase letter followed by lowercase letters (Unicode-aware).
      */
     fun cleanAndValidateCandidate(rawCandidate: String): String? {
         if (rawCandidate.isBlank()) return null
         val rawTokens = rawCandidate.trim().split(Regex("""\s+""")).filter { it.isNotBlank() }
         if (rawTokens.isEmpty()) return null
 
-        // Strip leading and trailing stopwords before validating
+        // Strip leading stopwords before validating
         var start = 0
         while (start < rawTokens.size && stopwordSet.contains(rawTokens[start].lowercase())) {
             start++
         }
+
+        // Trim trailing lowercase words after a name and trailing stopwords
         var end = rawTokens.size - 1
-        while (end >= start && stopwordSet.contains(rawTokens[end].lowercase())) {
+        while (end >= start && (stopwordSet.contains(rawTokens[end].lowercase()) || rawTokens[end].firstOrNull()?.isLowerCase() == true)) {
             end--
         }
 
@@ -465,6 +460,7 @@ class TagAttributor(
             "suddenly", "finally", "however", "meanwhile", "now", "here", "there", "just", "still", "also", "even", "only"
         )
 
+        // Irregular verbs list - note: "poked" and "laughed" removed (handled as standard -ed verbs in isVerb)
         private val IRREGULAR_VERBS = setOf(
             "stood", "sat", "spoke", "came", "went", "took", "ran", "held", "fell",
             "saw", "felt", "knew", "thought", "shook", "bent", "blew", "drew", "froze",
@@ -473,7 +469,7 @@ class TagAttributor(
             "slept", "slid", "slit", "spent", "spit", "split", "spread", "spun", "struck",
             "swam", "swung", "tore", "threw", "woke", "wore", "won", "wound", "wrote",
             "had", "was", "were", "did", "began", "caught", "bit", "broke", "brought",
-            "built", "bought", "drank", "ate", "fought", "found", "hung", "told", "poked", "laughed"
+            "built", "bought", "drank", "ate", "fought", "found", "hung", "told"
         )
 
         private val ADVERB_MARKERS = setOf(

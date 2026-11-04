@@ -9,24 +9,16 @@ data class VoiceSelectionResult(
 )
 
 /**
- * Pure Kotlin voice selector following multi-voice novel reading assignment rules.
+ * Pure Kotlin voice selector following multi-voice novel reading assignment rules:
+ * - Assigns distinct voices to characters.
+ * - Prefers a different locale, then a different voice name.
+ * - Ignores gender when the engine doesn't report it.
+ * - Uses the book's locale rather than a hardcoded default.
  */
 object VoiceSelector {
 
     /**
      * Picks an appropriate voice for [character] from [availableVoices].
-     *
-     * Selection rules:
-     * 1. Skip network-required voices (offline only).
-     * 2. If character.readByNarrator is true, always use the narrator's voice.
-     * 3. If character has an explicit voiceId:
-     *    - Use it if present in available voices.
-     *    - If missing on the device, fall back to the narrator's voice and set [VoiceSelectionResult.missingVoiceWarning].
-     * 4. Otherwise, match [Character.voiceGender] and the book's [bookLocale]:
-     *    - Prefer voices not in [usedVoices].
-     *    - Fall back to a different locale variant (e.g., en-GB vs en-AU) before reusing an already-used voice.
-     *    - Reuse a voice only if all matching variants are exhausted.
-     *    - Fall back to the narrator's voice if no suitable voice exists.
      */
     fun pick(
         character: Character,
@@ -65,8 +57,15 @@ object VoiceSelector {
             )
         }
 
-        // 3. Automated voice resolution based on gender and locale
+        // 3. Automated voice resolution
+        // "The selector prefers a different locale, then a different voice name, and ignores gender when the engine doesn't report it."
+        val engineReportsGender = localVoices.any { it.gender != VoiceGender.ANY }
+        val targetGender = if (engineReportsGender) character.voiceGender else VoiceGender.ANY
+
         val bookLang = extractLanguage(bookLocale)
+        val usedVoiceObjects = localVoices.filter { it.id in usedVoices }
+        val usedLocales = usedVoiceObjects.map { it.locale.lowercase() }.toSet()
+        val usedNames = usedVoiceObjects.map { it.name.lowercase() }.toSet()
 
         fun isExactLocale(voice: VoiceInfo): Boolean {
             return voice.locale.equals(bookLocale, ignoreCase = true)
@@ -76,70 +75,98 @@ object VoiceSelector {
             return extractLanguage(voice.locale).equals(bookLang, ignoreCase = true) && !isExactLocale(voice)
         }
 
-        if (character.voiceGender != VoiceGender.ANY) {
-            // Try exact gender match first
-            val exactGenderVoices = localVoices.filter { it.gender == character.voiceGender }
+        fun isSameLanguage(voice: VoiceInfo): Boolean {
+            return extractLanguage(voice.locale).equals(bookLang, ignoreCase = true)
+        }
 
-            // Priority 1a: exact gender + exact locale + unused
-            exactGenderVoices.firstOrNull { isExactLocale(it) && it.id !in usedVoices }?.let {
-                return VoiceSelectionResult(voice = it)
+        // Gender-constrained pool if engine reports gender and character specifies gender
+        if (targetGender != VoiceGender.ANY) {
+            val genderPool = localVoices.filter { it.gender == targetGender && it.id !in usedVoices }
+            if (genderPool.isNotEmpty()) {
+                // If character is Unnamed or narrator voice already used, prefer different locale
+                if (character.id == Character.UNNAMED_ID && usedLocales.isNotEmpty()) {
+                    genderPool.firstOrNull { it.locale.lowercase() !in usedLocales && isSameLanguage(it) }?.let {
+                        return VoiceSelectionResult(voice = it)
+                    }
+                }
+
+                // Priority 1a: exact gender + exact locale + unused
+                genderPool.firstOrNull { isExactLocale(it) }?.let {
+                    return VoiceSelectionResult(voice = it)
+                }
+
+                // Priority 1b: exact gender + different locale variant + unused
+                genderPool.firstOrNull { isSameLanguageVariant(it) }?.let {
+                    return VoiceSelectionResult(voice = it)
+                }
+
+                // Priority 1c: exact gender + any locale + unused
+                genderPool.firstOrNull()?.let {
+                    return VoiceSelectionResult(voice = it)
+                }
             }
 
-            // Priority 1b: exact gender + different locale variant + unused
-            exactGenderVoices.firstOrNull { isSameLanguageVariant(it) && it.id !in usedVoices }?.let {
+            // Fallback for specified gender across reused voices
+            val reusedGenderPool = localVoices.filter { it.gender == targetGender }
+            reusedGenderPool.firstOrNull { isExactLocale(it) }?.let {
                 return VoiceSelectionResult(voice = it)
             }
-
-            // Priority 1c: exact gender + any locale + unused
-            exactGenderVoices.firstOrNull { it.id !in usedVoices }?.let {
+            reusedGenderPool.firstOrNull { isSameLanguageVariant(it) }?.let {
                 return VoiceSelectionResult(voice = it)
             }
-
-            // Priority 1d: exact gender + exact locale (reused)
-            exactGenderVoices.firstOrNull { isExactLocale(it) }?.let {
-                return VoiceSelectionResult(voice = it)
-            }
-
-            // Priority 1e: exact gender + different locale variant (reused)
-            exactGenderVoices.firstOrNull { isSameLanguageVariant(it) }?.let {
-                return VoiceSelectionResult(voice = it)
-            }
-
-            // Priority 1f: exact gender + any locale (reused)
-            exactGenderVoices.firstOrNull()?.let {
+            reusedGenderPool.firstOrNull()?.let {
                 return VoiceSelectionResult(voice = it)
             }
         }
 
-        // Priority 2: ANY gender voices or character.voiceGender == ANY
-        val anyGenderVoices = localVoices.filter { it.gender == VoiceGender.ANY }
+        // When gender is ANY (or engine does not report gender):
+        // "The selector prefers a different locale, then a different voice name, and ignores gender when the engine doesn't report it."
+        val unusedVoices = localVoices.filter { it.id !in usedVoices }
+        if (unusedVoices.isNotEmpty()) {
+            if (usedLocales.isNotEmpty()) {
+                // 1. Different locale, same book language
+                unusedVoices.firstOrNull { it.locale.lowercase() !in usedLocales && isSameLanguage(it) }?.let {
+                    return VoiceSelectionResult(voice = it)
+                }
+                // 2. Different locale, any language
+                unusedVoices.firstOrNull { it.locale.lowercase() !in usedLocales }?.let {
+                    return VoiceSelectionResult(voice = it)
+                }
+                // 3. Different voice name (same locale)
+                unusedVoices.firstOrNull { it.name.lowercase() !in usedNames && isExactLocale(it) }?.let {
+                    return VoiceSelectionResult(voice = it)
+                }
+                // 4. Any unused voice with different name
+                unusedVoices.firstOrNull { it.name.lowercase() !in usedNames }?.let {
+                    return VoiceSelectionResult(voice = it)
+                }
+            } else {
+                // First run / no used voices (e.g. picking for Narrator):
+                // Prefer exact book locale
+                unusedVoices.firstOrNull { isExactLocale(it) }?.let {
+                    return VoiceSelectionResult(voice = it)
+                }
+                // Same language variant
+                unusedVoices.firstOrNull { isSameLanguageVariant(it) }?.let {
+                    return VoiceSelectionResult(voice = it)
+                }
+            }
 
-        // Priority 2a: ANY gender + exact locale + unused
-        anyGenderVoices.firstOrNull { isExactLocale(it) && it.id !in usedVoices }?.let {
+            unusedVoices.firstOrNull()?.let {
+                return VoiceSelectionResult(voice = it)
+            }
+        }
+
+        // Reused voices fallback
+        if (usedLocales.isNotEmpty()) {
+            localVoices.firstOrNull { it.locale.lowercase() !in usedLocales && isSameLanguage(it) }?.let {
+                return VoiceSelectionResult(voice = it)
+            }
+        }
+        localVoices.firstOrNull { isExactLocale(it) }?.let {
             return VoiceSelectionResult(voice = it)
         }
 
-        // Priority 2b: ANY gender + different locale variant + unused
-        anyGenderVoices.firstOrNull { isSameLanguageVariant(it) && it.id !in usedVoices }?.let {
-            return VoiceSelectionResult(voice = it)
-        }
-
-        // Priority 2c: ANY gender + any locale + unused
-        anyGenderVoices.firstOrNull { it.id !in usedVoices }?.let {
-            return VoiceSelectionResult(voice = it)
-        }
-
-        // Priority 2d: ANY gender (reused)
-        anyGenderVoices.firstOrNull { isExactLocale(it) }?.let {
-            return VoiceSelectionResult(voice = it)
-        }
-
-        // Priority 3: Any unused voice
-        localVoices.firstOrNull { it.id !in usedVoices }?.let {
-            return VoiceSelectionResult(voice = it)
-        }
-
-        // Fall back to narrator voice
         return VoiceSelectionResult(voice = narratorVoice)
     }
 

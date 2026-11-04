@@ -19,7 +19,6 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
 import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedQueue
 
@@ -31,7 +30,8 @@ import java.util.concurrent.ConcurrentLinkedQueue
  * - Speaks a silent warm-up utterance upon initialization.
  * - Queues any speak requests made before ready and drains them once ready.
  * - Applies setVoice, setPitch, setSpeechRate right before each speak(..., QUEUE_ADD, ...).
- * - Implements UtteranceProgressListener.onRangeStart for word ranges.
+ * - Emits speech events directly via tryEmit from UtteranceProgressListener callbacks.
+ * - Caches system TTS voices to avoid repeated expensive IPC calls.
  * - Only shuts down on release().
  * - Optional gapMs setting for speaker changes and paragraph breaks.
  */
@@ -62,6 +62,9 @@ class SystemTtsEngine(
     private val appContext = context.applicationContext
     private var textToSpeech: TextToSpeech? = null
 
+    private var cachedVoices: Set<Voice>? = null
+    private var cachedVoiceInfoList: List<VoiceInfo>? = null
+
     private val pendingQueue = ConcurrentLinkedQueue<QueuedSpeak>()
     private var lastSpokenVoiceId: String? = null
 
@@ -80,6 +83,10 @@ class SystemTtsEngine(
                     .build()
                 textToSpeech?.setAudioAttributes(audioAttributes)
 
+                // Cache voices immediately after successful initialization
+                cachedVoices = textToSpeech?.voices
+                cachedVoiceInfoList = null
+
                 configureProgressListener()
                 _engineState.value = EngineState.Ready
 
@@ -97,21 +104,25 @@ class SystemTtsEngine(
         }, enginePackage)
     }
 
+    private fun getCachedOrFetchVoices(): Set<Voice>? {
+        if (cachedVoices == null) {
+            cachedVoices = textToSpeech?.voices
+            cachedVoiceInfoList = null
+        }
+        return cachedVoices
+    }
+
     private fun configureProgressListener() {
         textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
                 if (utteranceId != null && !utteranceId.startsWith("warmup_") && !utteranceId.startsWith("gap_")) {
-                    scope.launch {
-                        _events.emit(SpeechEvent.Started(utteranceId))
-                    }
+                    _events.tryEmit(SpeechEvent.Started(utteranceId))
                 }
             }
 
             override fun onDone(utteranceId: String?) {
                 if (utteranceId != null && !utteranceId.startsWith("warmup_") && !utteranceId.startsWith("gap_")) {
-                    scope.launch {
-                        _events.emit(SpeechEvent.Done(utteranceId))
-                    }
+                    _events.tryEmit(SpeechEvent.Done(utteranceId))
                 }
             }
 
@@ -123,9 +134,7 @@ class SystemTtsEngine(
             override fun onError(utteranceId: String?, errorCode: Int) {
                 if (utteranceId != null && !utteranceId.startsWith("warmup_") && !utteranceId.startsWith("gap_")) {
                     val errorDesc = getErrorDescription(errorCode)
-                    scope.launch {
-                        _events.emit(SpeechEvent.Error(utteranceId, errorDesc, errorCode))
-                    }
+                    _events.tryEmit(SpeechEvent.Error(utteranceId, errorDesc, errorCode))
                 }
             }
 
@@ -133,9 +142,7 @@ class SystemTtsEngine(
                 if (utteranceId != null && start >= 0 && end >= start &&
                     !utteranceId.startsWith("warmup_") && !utteranceId.startsWith("gap_")
                 ) {
-                    scope.launch {
-                        _events.emit(SpeechEvent.Range(start = start, end = end, utteranceId = utteranceId))
-                    }
+                    _events.tryEmit(SpeechEvent.Range(start = start, end = end, utteranceId = utteranceId))
                 }
             }
         })
@@ -165,16 +172,14 @@ class SystemTtsEngine(
         isSpeakerChange: Boolean
     ) {
         val tts = textToSpeech ?: run {
-            scope.launch {
-                _events.emit(SpeechEvent.Error(utteranceId, "TextToSpeech engine not available"))
-            }
+            _events.tryEmit(SpeechEvent.Error(utteranceId, "TextToSpeech engine not available"))
             return
         }
 
         try {
-            // 1. Right before speak, set voice
+            // 1. Right before speak, set voice using cached voices
             if (voice?.id != null) {
-                val matchingVoice = tts.voices?.firstOrNull { it.name == voice.id }
+                val matchingVoice = getCachedOrFetchVoices()?.firstOrNull { it.name == voice.id }
                 if (matchingVoice != null) {
                     tts.voice = matchingVoice
                 }
@@ -200,26 +205,22 @@ class SystemTtsEngine(
             lastSpokenVoiceId = voice?.id
 
             if (result != TextToSpeech.SUCCESS) {
-                scope.launch {
-                    _events.emit(
-                        SpeechEvent.Error(
-                            utteranceId = utteranceId,
-                            message = "TextToSpeech.speak QUEUE_ADD failed with code $result",
-                            errorCode = result
-                        )
-                    )
-                }
-            }
-        } catch (e: Exception) {
-            scope.launch {
-                _events.emit(
+                _events.tryEmit(
                     SpeechEvent.Error(
                         utteranceId = utteranceId,
-                        message = e.localizedMessage ?: "Unknown TTS exception",
-                        errorCode = TextToSpeech.ERROR
+                        message = "TextToSpeech.speak QUEUE_ADD failed with code $result",
+                        errorCode = result
                     )
                 )
             }
+        } catch (e: Exception) {
+            _events.tryEmit(
+                SpeechEvent.Error(
+                    utteranceId = utteranceId,
+                    message = e.localizedMessage ?: "Unknown TTS exception",
+                    errorCode = TextToSpeech.ERROR
+                )
+            )
         }
     }
 
@@ -244,7 +245,7 @@ class SystemTtsEngine(
         val tts = textToSpeech ?: return
         try {
             if (voice?.id != null) {
-                tts.voices?.firstOrNull { it.name == voice.id }?.let { tts.voice = it }
+                getCachedOrFetchVoices()?.firstOrNull { it.name == voice.id }?.let { tts.voice = it }
             }
             // Silent warm-up utterance with narrator voice
             tts.playSilentUtterance(50, TextToSpeech.QUEUE_FLUSH, "warmup_silent_${System.currentTimeMillis()}")
@@ -259,15 +260,17 @@ class SystemTtsEngine(
         stop()
         textToSpeech?.shutdown()
         textToSpeech = null
+        cachedVoices = null
+        cachedVoiceInfoList = null
         _isReady.value = false
         _engineState.value = EngineState.Uninitialized
     }
 
     override fun getAvailableVoices(): List<VoiceInfo> {
-        val tts = textToSpeech ?: return emptyList()
-        val systemVoices = tts.voices ?: return emptyList()
+        cachedVoiceInfoList?.let { return it }
+        val systemVoices = getCachedOrFetchVoices() ?: return emptyList()
 
-        return systemVoices.map { voice ->
+        val mapped = systemVoices.map { voice ->
             val gender = detectVoiceGender(voice)
             VoiceInfo(
                 id = voice.name,
@@ -279,6 +282,9 @@ class SystemTtsEngine(
                 requiresNetwork = voice.isNetworkConnectionRequired
             )
         }.sortedWith(compareBy({ it.locale }, { it.name }))
+
+        cachedVoiceInfoList = mapped
+        return mapped
     }
 
     private fun detectVoiceGender(voice: Voice): VoiceGender {

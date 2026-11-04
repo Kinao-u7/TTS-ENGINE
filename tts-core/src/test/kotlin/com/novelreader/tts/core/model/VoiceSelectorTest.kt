@@ -103,19 +103,85 @@ class VoiceSelectorTest {
     }
 
     @Test
-    fun `skips network required voices`() {
-        val maleChar = Character(
-            id = "char_soldier",
-            name = "Soldier",
-            voiceGender = VoiceGender.MALE
-        )
-        val onlyNetworkList = listOf(
-            VoiceInfo(id = "voice_narrator", name = "Narrator", locale = "en-US"),
-            VoiceInfo(id = "voice_net", name = "Network Voice", locale = "en-US", gender = VoiceGender.MALE, requiresNetwork = true)
-        )
-        val res = VoiceSelector.pick(maleChar, onlyNetworkList, narratorVoiceId = "voice_narrator")
+    fun `narrator and unnamed get distinct voices preferring different locale then different voice name`() {
+        val narratorChar = Character(id = Character.NARRATOR_ID, name = "Narrator", voiceGender = VoiceGender.ANY)
+        val unnamedChar = Character(id = Character.UNNAMED_ID, name = "Unnamed", voiceGender = VoiceGender.ANY)
 
-        // Network voice must be skipped, falls back to narrator voice
-        assertEquals("voice_narrator", res.voice?.id)
+        val narratorResult = VoiceSelector.pick(
+            character = narratorChar,
+            availableVoices = fakeVoices,
+            usedVoices = emptySet(),
+            bookLocale = "en-US"
+        )
+        assertNotNull(narratorResult.voice)
+        assertEquals("en-US", narratorResult.voice?.locale)
+
+        val unnamedResult = VoiceSelector.pick(
+            character = unnamedChar,
+            availableVoices = fakeVoices,
+            usedVoices = setOf(narratorResult.voice!!.id),
+            bookLocale = "en-US",
+            narratorVoiceId = narratorResult.voice!!.id
+        )
+        assertNotNull(unnamedResult.voice)
+        // Distinct voices
+        assertTrue(unnamedResult.voice?.id != narratorResult.voice?.id)
+        // Prefers different locale variant (en-GB or en-AU) over en-US
+        assertTrue(unnamedResult.voice?.locale != "en-US")
+    }
+
+    @Test
+    fun `prefers different voice name when no different locale exists`() {
+        val singleLocaleVoices = listOf(
+            VoiceInfo(id = "v_us_1", name = "US Voice 1", locale = "en-US", gender = VoiceGender.ANY),
+            VoiceInfo(id = "v_us_2", name = "US Voice 2", locale = "en-US", gender = VoiceGender.ANY)
+        )
+        val char = Character(id = Character.UNNAMED_ID, name = "Unnamed")
+        val result = VoiceSelector.pick(
+            character = char,
+            availableVoices = singleLocaleVoices,
+            usedVoices = setOf("v_us_1"),
+            bookLocale = "en-US"
+        )
+        assertEquals("v_us_2", result.voice?.id)
+    }
+
+    @Test
+    fun `ignores gender when engine does not report it`() {
+        val genderlessVoices = listOf(
+            VoiceInfo(id = "voice_any_1", name = "Any Voice 1", locale = "en-US", gender = VoiceGender.ANY),
+            VoiceInfo(id = "voice_any_2", name = "Any Voice 2", locale = "en-GB", gender = VoiceGender.ANY)
+        )
+        val femaleChar = Character(
+            id = "char_female",
+            name = "Female Char",
+            voiceGender = VoiceGender.FEMALE
+        )
+        val result = VoiceSelector.pick(
+            character = femaleChar,
+            availableVoices = genderlessVoices,
+            usedVoices = emptySet(),
+            bookLocale = "en-US"
+        )
+        assertNotNull(result.voice)
+        assertEquals("voice_any_1", result.voice?.id)
+    }
+
+    @Test
+    fun `takes locale from the book not hardcoded en-US`() {
+        val frenchVoices = listOf(
+            VoiceInfo(id = "voice_fr_1", name = "French 1", locale = "fr-FR", gender = VoiceGender.ANY),
+            VoiceInfo(id = "voice_fr_ca", name = "French CA", locale = "fr-CA", gender = VoiceGender.ANY),
+            VoiceInfo(id = "voice_us", name = "English US", locale = "en-US", gender = VoiceGender.ANY)
+        )
+        val narratorChar = Character(id = Character.NARRATOR_ID, name = "Narrator")
+        val res = VoiceSelector.pick(
+            character = narratorChar,
+            availableVoices = frenchVoices,
+            usedVoices = emptySet(),
+            bookLocale = "fr-FR"
+        )
+        assertEquals("voice_fr_1", res.voice?.id)
+        assertEquals("fr-FR", res.voice?.locale)
     }
 }
