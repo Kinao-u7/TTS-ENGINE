@@ -126,6 +126,33 @@ class InMemoryCastStore : CastStore {
         }
     }
 
+    override suspend fun removeAutoCreatedCharacters(bookId: String) {
+        mutex.withLock {
+            val bookChars = charactersData.getOrPut(bookId) { createDefaultCharacters() }
+            val autoChars = bookChars.values.filter { it.autoCreated && it.isDeletable }
+            val ignored = ignoredNamesData.getOrPut(bookId) { mutableSetOf() }
+
+            for (char in autoChars) {
+                ignored.add(char.name.trim().lowercase())
+                char.aliases.forEach { ignored.add(it.trim().lowercase()) }
+                bookChars.remove(char.id)
+
+                overridesData[bookId]?.values?.forEach { chapterMap ->
+                    val iterator = chapterMap.entries.iterator()
+                    while (iterator.hasNext()) {
+                        if (iterator.next().value == char.id) {
+                            iterator.remove()
+                        }
+                    }
+                }
+            }
+
+            ensureBuiltInsExist(bookChars)
+            val flow = getOrCreateFlowLocked(bookId)
+            flow.value = bookChars.values.toList()
+        }
+    }
+
     private fun ensureBuiltInsExist(map: MutableMap<String, Character>) {
         if (!map.containsKey(Character.NARRATOR_ID)) {
             map[Character.NARRATOR_ID] = Character.Narrator

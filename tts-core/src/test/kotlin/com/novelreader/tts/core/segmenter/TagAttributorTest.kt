@@ -231,7 +231,7 @@ class TagAttributorTest {
 
     @Test
     fun `action beat with poked the embers assigns Xian`() {
-        val text = "Xian poked the embers. \"Before noon, or before the fog thickens?\""
+        val text = "Xian poked the embers. \"Before noon, or before the fog thickens?\"\nXian stood up. \"Answer me.\""
         val segments = NovelSegmenter.segment(text)
         val result = attributor.attribute(segments)
         val dialogue = result.segments.first { it.type == SegmentType.DIALOGUE }
@@ -244,7 +244,7 @@ class TagAttributorTest {
 
     @Test
     fun `action beat with laughed assigns Xian`() {
-        val text = "Xian laughed. \"You say that about everyone.\""
+        val text = "Xian laughed. \"You say that about everyone.\"\nXian grinned. \"Even yourself.\""
         val segments = NovelSegmenter.segment(text)
         val result = attributor.attribute(segments)
         val dialogue = result.segments.first { it.type == SegmentType.DIALOGUE }
@@ -319,6 +319,84 @@ class TagAttributorTest {
         assertEquals(SegmentType.DIALOGUE, dialogue.type)
 
         // Across newline paragraph boundary -> stays unnamed
+        assertNull(dialogue.speakerId)
+        assertEquals(Character.UNNAMED_ID, dialogue.effectiveSpeakerId)
+    }
+
+    @Test
+    fun `stopwords produce no character for And said, said and, Seeing as, Then said, and As said`() {
+        val cases = listOf(
+            "And said, \"No.\"",
+            "\"No,\" said and.",
+            "Seeing as said, \"No.\"",
+            "Then said, \"No.\"",
+            "As said, \"No.\""
+        )
+        for (caseText in cases) {
+            val segments = NovelSegmenter.segment(caseText)
+            val result = attributor.attribute(segments)
+            val dialogue = result.segments.first { it.type == SegmentType.DIALOGUE }
+            assertNull("Expected unnamed for '$caseText'", dialogue.speakerId)
+            assertEquals(Character.UNNAMED_ID, dialogue.effectiveSpeakerId)
+            assertTrue("Expected no custom character for '$caseText'", result.characters.none { it.isDeletable })
+        }
+    }
+
+    @Test
+    fun `name seen once in a weak pattern is not created and same name seen twice is`() {
+        // Seen once in action beat (weak pattern) -> not created, dialogue unnamed
+        val singleText = "Bob poked the embers. \"Before noon, or before the fog thickens?\""
+        val singleSegments = NovelSegmenter.segment(singleText)
+        val singleResult = attributor.attribute(singleSegments)
+        val singleDialogue = singleResult.segments.first { it.type == SegmentType.DIALOGUE }
+        assertNull(singleDialogue.speakerId)
+        assertEquals(Character.UNNAMED_ID, singleDialogue.effectiveSpeakerId)
+        assertNull(singleResult.characters.firstOrNull { it.name == "Bob" })
+
+        // Same name seen twice in action beats in same chapter -> created and assigned
+        val doubleText = "Bob poked the embers. \"Before noon, or before the fog thickens?\"\nBob laughed. \"You say that about everyone.\""
+        val doubleSegments = NovelSegmenter.segment(doubleText)
+        val doubleResult = attributor.attribute(doubleSegments)
+        val dialogues = doubleResult.segments.filter { it.type == SegmentType.DIALOGUE }
+        assertEquals(2, dialogues.size)
+
+        val bobChar = doubleResult.characters.firstOrNull { it.name == "Bob" }
+        assertNotNull(bobChar)
+        assertEquals(bobChar?.id, dialogues[0].speakerId)
+        assertEquals(bobChar?.id, dialogues[1].speakerId)
+        assertTrue(bobChar!!.autoCreated)
+    }
+
+    @Test
+    fun `multi-word candidate with sentence-initial stopword strips stopword`() {
+        val text = "And Xian said, \"We leave at dawn.\""
+        val segments = NovelSegmenter.segment(text)
+        val result = attributor.attribute(segments)
+        val dialogue = result.segments.first { it.type == SegmentType.DIALOGUE }
+        val xianChar = result.characters.firstOrNull { it.name == "Xian" }
+        assertNotNull(xianChar)
+        assertEquals(xianChar?.id, dialogue.speakerId)
+        assertEquals("Xian", xianChar?.name)
+    }
+
+    @Test
+    fun `unicode names like Elodie work`() {
+        val text = "\"Bonjour,\" said Élodie."
+        val segments = NovelSegmenter.segment(text)
+        val result = attributor.attribute(segments)
+        val dialogue = result.segments.first { it.type == SegmentType.DIALOGUE }
+        val elodieChar = result.characters.firstOrNull { it.name == "Élodie" }
+        assertNotNull(elodieChar)
+        assertEquals(elodieChar?.id, dialogue.speakerId)
+        assertEquals("Élodie", elodieChar?.name)
+    }
+
+    @Test
+    fun `single token of two or fewer letters is rejected`() {
+        val text = "\"Hello,\" said Al."
+        val segments = NovelSegmenter.segment(text)
+        val result = attributor.attribute(segments)
+        val dialogue = result.segments.first { it.type == SegmentType.DIALOGUE }
         assertNull(dialogue.speakerId)
         assertEquals(Character.UNNAMED_ID, dialogue.effectiveSpeakerId)
     }

@@ -53,4 +53,10 @@ interface CastStore {
      * Unignores a character name for [bookId].
      */
     suspend fun unignoreName(bookId: String, name: String)
+
+    /**
+     * Deletes all characters flagged as [Character.autoCreated] for [bookId],
+     * adding their names and aliases to the ignored names list and reverting overrides.
+     */
+    suspend fun removeAutoCreatedCharacters(bookId: String)
 }

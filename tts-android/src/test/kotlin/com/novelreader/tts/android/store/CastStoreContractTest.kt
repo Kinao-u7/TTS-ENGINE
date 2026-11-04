@@ -397,4 +397,48 @@ class JsonFileCastStoreSpecificTest {
         assertEquals(1, generalLinMatches.size)
         assertEquals("General Lin", generalLinMatches[0].name)
     }
+
+    @Test
+    fun `remove auto-created characters deletes only autoCreated characters and adds them to ignored list`() = runTest {
+        val manualChar = Character(
+            id = "char_manual",
+            name = "Manual Hero",
+            autoCreated = false
+        )
+        val autoChar = Character(
+            id = "char_auto",
+            name = "Auto Detected",
+            autoCreated = true
+        )
+        store.saveCharacter(bookId, manualChar)
+        store.saveCharacter(bookId, autoChar)
+
+        store.removeAutoCreatedCharacters(bookId)
+
+        val currentChars = store.characters(bookId).first()
+        assertTrue("Manual character must not be deleted", currentChars.any { it.id == manualChar.id })
+        assertFalse("Auto-created character must be deleted", currentChars.any { it.id == autoChar.id })
+
+        val ignored = store.ignoredNames(bookId)
+        assertTrue("Deleted auto character must be added to ignored names", ignored.contains("auto detected"))
+        assertFalse("Manual character must not be in ignored names", ignored.contains("manual hero"))
+    }
+
+    @Test
+    fun `editing auto-created character clears autoCreated flag and prevents deletion`() = runTest {
+        val autoChar = Character(
+            id = "char_auto_2",
+            name = "Auto Detected Two",
+            autoCreated = true
+        )
+        store.saveCharacter(bookId, autoChar)
+
+        // User edits character -> autoCreated cleared to false
+        val editedChar = autoChar.copy(name = "User Renamed", autoCreated = false)
+        store.saveCharacter(bookId, editedChar)
+
+        store.removeAutoCreatedCharacters(bookId)
+        val currentChars = store.characters(bookId).first()
+        assertTrue("Edited character must not be deleted", currentChars.any { it.id == autoChar.id })
+    }
 }

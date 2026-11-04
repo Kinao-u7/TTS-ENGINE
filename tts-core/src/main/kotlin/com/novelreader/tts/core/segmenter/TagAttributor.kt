@@ -21,31 +21,33 @@ data class AttributionResult(
  * like `"...," said Name` and `Name said, "..."`.
  */
 class TagAttributor(
-    verbs: List<String> = DEFAULT_VERBS
+    verbs: List<String> = DEFAULT_VERBS,
+    stopwords: Set<String> = DEFAULT_STOPWORDS
 ) {
     private val speechVerbs: Set<String> = verbs.map { it.lowercase() }.toSet()
+    private val stopwordSet: Set<String> = stopwords.map { it.trim().lowercase() }.toSet()
+
     private val verbsPattern: String = speechVerbs
         .flatMap { listOf(it.lowercase(), it.replaceFirstChar { c -> if (c.isLowerCase()) c.titlecase() else c.toString() }, it.uppercase()) }
         .distinct()
         .joinToString("|") { Regex.escape(it) }
 
     // Pattern 1a: after quote - `," said Lin`, `," asked Xian`, `," whispered Chen Yu`, `," called back Xian`
-    // Name is 1-3 capitalized words. Optional trailing particle after verb must be lowercase and not "to".
+    // (?i) applied only to the verb part, NOT to the candidate name part.
     private val postSaidNameRegex = Regex(
-        """^\s*[,—–-]?\s*(?:$verbsPattern)(?:\s+(?!to\b)[a-z][a-z0-9_']*)?\s+([A-Z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*){0,2})(?:\s+to\s+[A-Za-z0-9_']+(?:\s+[A-Za-z0-9_']+)*)?\b"""
+        """^\s*[,—–-]?\s*(?i:$verbsPattern)(?:\s+(?i:(?!to\b)[a-z]+))?\s+([\p{L}]+(?:\s+[\p{L}]+){0,3})(?:\s+(?i:to)\s+[\p{L}]+(?:\s+[\p{L}]+)*)?\b"""
     )
 
-    // Pattern 1b: after quote - `," Lin Mo said`, `," Xian called back`, `," he said`
-    // Subject is 1-3 capitalized words or single lowercase pronoun.
+    // Pattern 1b: after quote - `," Lin Mo said`, `," Xian called back`, `," And Xian said`
+    // (?i) applied only to the verb part, NOT to the candidate name part.
     private val postNameSaidRegex = Regex(
-        """^\s*[,—–-]?\s*([A-Z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*){0,2}|[a-z]+)\s+(?:$verbsPattern)(?:\s+(?!to\b)[a-z][a-z0-9_']*)?(?:\s+to\s+[A-Za-z0-9_']+(?:\s+[A-Za-z0-9_']+)*)?\b"""
+        """^\s*[,—–-]?\s*([\p{L}]+(?:\s+[\p{L}]+){0,3})\s+(?i:$verbsPattern)(?:\s+(?i:(?!to\b)[a-z]+))?(?:\s+(?i:to)\s+[\p{L}]+(?:\s+[\p{L}]+)*)?\b"""
     )
 
-    // Pattern 2: before quote - `Lin Mo said, "..."` or `Xian called back: "..."` or `He said to Xian:\n"..."`
-    // Extracts subject before the speech verb. Note: recipient in `said to <Recipient>` is NOT the speaker!
-    // Action beats like `Xian poked the embers.` do not end with a speech verb, so they do not match.
+    // Pattern 2: before quote - `Lin Mo said, "..."` or `And Xian said: "..."`
+    // (?i) applied only to the verb part, NOT to the candidate name part.
     private val preQuoteRegex = Regex(
-        """([A-Z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*){0,2}|[a-z]+)\s+(?:$verbsPattern)(?:\s+(?!to\b)[a-z][a-z0-9_']*)?(?:\s+to\s+[A-Za-z0-9_']+(?:\s+[A-Za-z0-9_']+)*)?\s*[,:]?\s*$"""
+        """([\p{L}]+(?:\s+[\p{L}]+){0,3})\s+(?i:$verbsPattern)(?:\s+(?i:(?!to\b)[a-z]+))?(?:\s+(?i:to)\s+[\p{L}]+(?:\s+[\p{L}]+)*)?\s*[,:]?\s*$"""
     )
 
     private enum class TagSource {
@@ -53,6 +55,12 @@ class TagAttributor(
         CONTINUATION,
         ACTION_BEAT
     }
+
+    private data class CandidateInfo(
+        val name: String,
+        val source: TagSource,
+        val hasSpeechVerb: Boolean
+    )
 
     /**
      * Attributes speakers for all dialogue segments in [segments].
@@ -79,8 +87,7 @@ class TagAttributor(
         }
 
         val normalizedIgnored = ignoredNames.map { it.trim().lowercase() }.toSet()
-        val assignedSpeakerIds = Array<String?>(segments.size) { null }
-        val assignmentSources = Array<TagSource?>(segments.size) { null }
+        val candidates = Array<CandidateInfo?>(segments.size) { null }
 
         // Compute paragraph indices for all segments based on newline boundaries
         val paragraphIndices = computeParagraphIndices(segments)
@@ -91,10 +98,12 @@ class TagAttributor(
         for (i in segments.indices) {
             if (segments[i].type == SegmentType.DIALOGUE) {
                 val candidateName = findSpeakerCandidate(segments, i)
-                if (candidateName != null && !isPronoun(candidateName) && !normalizedIgnored.contains(candidateName.trim().lowercase())) {
-                    val resolvedChar = resolveOrCreate(candidateName, characterList)
-                    assignedSpeakerIds[i] = resolvedChar.id
-                    assignmentSources[i] = TagSource.SPEECH_TAG
+                if (candidateName != null && !normalizedIgnored.contains(candidateName.trim().lowercase())) {
+                    candidates[i] = CandidateInfo(
+                        name = candidateName,
+                        source = TagSource.SPEECH_TAG,
+                        hasSpeechVerb = true
+                    )
                 }
             }
         }
@@ -112,20 +121,22 @@ class TagAttributor(
         val parasWithConflictingSpeakers = mutableSetOf<Int>()
 
         for ((paraIndex, dIndices) in dialogueIndicesByPara) {
-            val speechTagSpeakerIds = dIndices
-                .filter { assignmentSources[it] == TagSource.SPEECH_TAG }
-                .mapNotNull { assignedSpeakerIds[it] }
-                .distinct()
+            val speechTagSpeakers = dIndices
+                .mapNotNull { idx -> candidates[idx]?.takeIf { it.source == TagSource.SPEECH_TAG }?.name }
+                .distinctBy { it.lowercase() }
 
-            if (speechTagSpeakerIds.size == 1) {
-                val singleSpeakerId = speechTagSpeakerIds.first()
+            if (speechTagSpeakers.size == 1) {
+                val singleSpeakerName = speechTagSpeakers.first()
                 for (idx in dIndices) {
-                    if (assignedSpeakerIds[idx] == null) {
-                        assignedSpeakerIds[idx] = singleSpeakerId
-                        assignmentSources[idx] = TagSource.CONTINUATION
+                    if (candidates[idx] == null) {
+                        candidates[idx] = CandidateInfo(
+                            name = singleSpeakerName,
+                            source = TagSource.CONTINUATION,
+                            hasSpeechVerb = false
+                        )
                     }
                 }
-            } else if (speechTagSpeakerIds.size > 1) {
+            } else if (speechTagSpeakers.size > 1) {
                 parasWithConflictingSpeakers.add(paraIndex)
             }
         }
@@ -135,20 +146,66 @@ class TagAttributor(
         // If the sentence immediately before a quote (same paragraph) starts with a
         // capitalized name (1 to 3 words, or a name matching an existing character or alias)
         // followed by a verb, and the quote has no tag of its own, assign that name.
-        // Pronouns stay Unnamed. Sentences containing "said to <Name>" or "told <Name>" never assign recipient.
-        // Untagged dialogue in paragraphs with multiple conflicting speech tags remain Unnamed.
         // -------------------------------------------------------------------------
         for (i in segments.indices) {
-            if (segments[i].type == SegmentType.DIALOGUE && assignedSpeakerIds[i] == null) {
+            if (segments[i].type == SegmentType.DIALOGUE && candidates[i] == null) {
                 val para = paragraphIndices[i]
                 if (!parasWithConflictingSpeakers.contains(para)) {
                     val candidateName = findActionBeatCandidate(segments, i, characterList, normalizedIgnored)
                     if (candidateName != null) {
-                        val resolvedChar = resolveOrCreate(candidateName, characterList)
-                        assignedSpeakerIds[i] = resolvedChar.id
-                        assignmentSources[i] = TagSource.ACTION_BEAT
+                        candidates[i] = CandidateInfo(
+                            name = candidateName,
+                            source = TagSource.ACTION_BEAT,
+                            hasSpeechVerb = false
+                        )
                     }
                 }
+            }
+        }
+
+        // -------------------------------------------------------------------------
+        // Priority 4: Confirmation Threshold & Character Creation
+        // A new name is only created as a Character after it is attributed at least
+        // twice in the same chapter, OR once if it matches an existing character name
+        // or alias, OR if it appears in the strong pattern '"..." said Name' with a speech verb.
+        // Otherwise leave the segment as Unnamed and don't create anything.
+        // -------------------------------------------------------------------------
+        val candidateCounts = mutableMapOf<String, Int>()
+        for (c in candidates) {
+            if (c != null) {
+                val key = c.name.lowercase()
+                candidateCounts[key] = (candidateCounts[key] ?: 0) + 1
+            }
+        }
+
+        fun isCandidateConfirmed(name: String): Boolean {
+            // 1. Matches an existing character name or alias
+            if (characterList.any { it.matchesName(name) && !it.isBuiltIn }) {
+                return true
+            }
+            // 2. Appears in strong pattern with a speech verb
+            val hasSpeechVerb = candidates.any {
+                it != null && it.name.equals(name, ignoreCase = true) && it.hasSpeechVerb
+            }
+            if (hasSpeechVerb) {
+                return true
+            }
+            // 3. Attributed at least twice in the same chapter
+            val count = candidateCounts[name.lowercase()] ?: 0
+            if (count >= 2) {
+                return true
+            }
+            return false
+        }
+
+        val assignedSpeakerIds = Array<String?>(segments.size) { null }
+        for (i in segments.indices) {
+            val cand = candidates[i]
+            if (cand != null && isCandidateConfirmed(cand.name)) {
+                val resolvedChar = resolveOrCreate(cand.name, characterList)
+                assignedSpeakerIds[i] = resolvedChar.id
+            } else {
+                assignedSpeakerIds[i] = null
             }
         }
 
@@ -202,15 +259,17 @@ class TagAttributor(
                 // Pattern 1a: `said Name`
                 val matchSaidName = postSaidNameRegex.find(nextText)
                 if (matchSaidName != null) {
-                    val name = matchSaidName.groupValues[1].trim()
-                    if (isValidNameCandidate(name)) return name
+                    val raw = matchSaidName.groupValues[1]
+                    val validated = cleanAndValidateCandidate(raw)
+                    if (validated != null) return validated
                 }
 
                 // Pattern 1b: `Name said`
                 val matchNameSaid = postNameSaidRegex.find(nextText)
                 if (matchNameSaid != null) {
-                    val name = matchNameSaid.groupValues[1].trim()
-                    if (isValidNameCandidate(name)) return name
+                    val raw = matchNameSaid.groupValues[1]
+                    val validated = cleanAndValidateCandidate(raw)
+                    if (validated != null) return validated
                 }
             }
         }
@@ -222,8 +281,9 @@ class TagAttributor(
                 val prevText = prevSeg.text
                 val matchPre = preQuoteRegex.find(prevText)
                 if (matchPre != null) {
-                    val subject = matchPre.groupValues[1].trim()
-                    if (isValidNameCandidate(subject)) return subject
+                    val raw = matchPre.groupValues[1]
+                    val validated = cleanAndValidateCandidate(raw)
+                    if (validated != null) return validated
                 }
             }
         }
@@ -250,7 +310,7 @@ class TagAttributor(
         if (sentence.isBlank()) return null
 
         // A sentence containing "said to <Name>" or "told <Name>" never assigns the recipient
-        val recipientMatch = Regex("""\b(?:said\s+to|told)\s+([A-Za-z0-9_']+)""", RegexOption.IGNORE_CASE).find(sentence)
+        val recipientMatch = Regex("""\b(?:said\s+to|told)\s+([\p{L}]+)""", RegexOption.IGNORE_CASE).find(sentence)
         val recipient = recipientMatch?.groupValues?.get(1)?.trim()?.lowercase()
 
         // If this sentence is itself a speech-verb tag for the quote or prior dialogue, it's not an action beat
@@ -258,7 +318,7 @@ class TagAttributor(
             return null
         }
 
-        // Check existing characters and aliases (case-insensitive)
+        // 1. Check existing characters and aliases (case-insensitive)
         val knownCandidates = characterList
             .filter { it.id != Character.NARRATOR_ID && it.id != Character.UNNAMED_ID }
             .flatMap { char -> (listOf(char.name) + char.aliases).map { it to char } }
@@ -277,21 +337,20 @@ class TagAttributor(
             }
         }
 
-        // Match 1 to 3 capitalized words at start of sentence
-        val capMatch = Regex("""^([A-Z][a-zA-Z0-9_']*(?:\s+[A-Z][a-zA-Z0-9_']*){0,2})\b""").find(sentence)
+        // 2. Match 1 to 4 words at start of sentence, validated through cleanAndValidateCandidate
+        val capMatch = Regex("""^([\p{L}]+(?:\s+[\p{L}]+){0,3})\b""").find(sentence)
         if (capMatch != null) {
-            val rawName = capMatch.groupValues[1].trim()
-            val lower = rawName.lowercase()
-            if (isPronoun(lower)) return null
-            if (NON_NAME_WORDS.contains(lower)) return null
-            val words = rawName.split(Regex("""\s+""")).filter { it.isNotBlank() }
-            if (words.any { it.length < 2 || NON_NAME_WORDS.contains(it.lowercase()) || isPronoun(it.lowercase()) }) return null
-            if (recipient != null && lower == recipient) return null
-            if (normalizedIgnored.contains(lower)) return null
+            val rawName = capMatch.groupValues[1]
+            val validated = cleanAndValidateCandidate(rawName)
+            if (validated != null) {
+                val lower = validated.lowercase()
+                if (recipient != null && lower == recipient) return null
+                if (normalizedIgnored.contains(lower)) return null
 
-            val remainder = sentence.substring(capMatch.range.last + 1).trimStart()
-            if (isFollowedByVerb(remainder)) {
-                return rawName
+                val remainder = sentence.substring(capMatch.range.last + 1).trimStart()
+                if (isFollowedByVerb(remainder)) {
+                    return validated
+                }
             }
         }
 
@@ -324,14 +383,50 @@ class TagAttributor(
         return false
     }
 
-    private fun isValidNameCandidate(name: String): Boolean {
-        if (name.isBlank()) return false
-        if (isPronoun(name)) return false
-        val lower = name.trim().lowercase()
-        if (NON_NAME_WORDS.contains(lower)) return false
-        val words = name.split(Regex("""\s+""")).filter { it.isNotBlank() }
-        if (words.any { it.length < 2 || NON_NAME_WORDS.contains(it.lowercase()) || isPronoun(it.lowercase()) }) return false
-        return true
+    /**
+     * Cleans and validates a candidate name string according to all rules:
+     * 1. Multi-word: accepts up to 3 capitalized tokens.
+     * 2. Strips leading and trailing stopwords before validating (e.g. "And Xian" -> "Xian").
+     * 3. Rejects if any remaining token is in the stoplist.
+     * 4. Rejects single-token candidates of two or fewer letters.
+     * 5. Case-sensitive: each token must start with an uppercase letter followed by lowercase letters (Unicode-aware).
+     */
+    fun cleanAndValidateCandidate(rawCandidate: String): String? {
+        if (rawCandidate.isBlank()) return null
+        val rawTokens = rawCandidate.trim().split(Regex("""\s+""")).filter { it.isNotBlank() }
+        if (rawTokens.isEmpty()) return null
+
+        // Strip leading and trailing stopwords before validating
+        var start = 0
+        while (start < rawTokens.size && stopwordSet.contains(rawTokens[start].lowercase())) {
+            start++
+        }
+        var end = rawTokens.size - 1
+        while (end >= start && stopwordSet.contains(rawTokens[end].lowercase())) {
+            end--
+        }
+
+        if (start > end) return null
+
+        val tokens = rawTokens.subList(start, end + 1)
+
+        // Accept up to three capitalized tokens
+        if (tokens.isEmpty() || tokens.size > 3) return null
+
+        // Reject candidates that are a single token of two or fewer letters
+        if (tokens.size == 1 && tokens[0].length <= 2) return null
+
+        // Each token must start with an uppercase letter followed by lowercase letters (Unicode-aware)
+        for (token in tokens) {
+            if (!NAME_TOKEN_REGEX.matches(token)) return null
+        }
+
+        // Reject a candidate if any token (case-insensitive) is in the stoplist
+        for (token in tokens) {
+            if (stopwordSet.contains(token.lowercase())) return null
+        }
+
+        return tokens.joinToString(" ")
     }
 
     private fun resolveOrCreate(name: String, characters: MutableList<Character>): Character {
@@ -353,18 +448,38 @@ class TagAttributor(
         val newCharacter = Character(
             id = uniqueId,
             name = name,
-            voiceGender = VoiceGender.ANY
+            voiceGender = VoiceGender.ANY,
+            autoCreated = true
         )
         characters.add(newCharacter)
         return newCharacter
     }
 
     companion object {
+        private val NAME_TOKEN_REGEX = Regex("""^\p{Lu}\p{Ll}+$""")
+
         val DEFAULT_VERBS = listOf(
             "said", "asked", "replied", "whispered", "shouted",
             "muttered", "answered", "cried", "called", "murmured",
             "exclaimed", "gasped", "screamed", "yelled", "groaned",
             "breathed", "demanded", "hissed", "growled"
+        )
+
+        val DEFAULT_STOPWORDS: Set<String> = setOf(
+            // pronouns
+            "he", "she", "they", "it", "we", "you", "i",
+            "him", "her", "them", "us", "me", "his", "their", "our", "my", "your",
+            "himself", "herself", "themselves", "itself", "myself", "yourself", "ourselves",
+            "someone", "somebody", "everyone", "everybody", "nobody", "no one",
+            "who", "whoever", "whom", "whose", "which", "what",
+            // articles and conjunctions
+            "a", "an", "the", "and", "or", "but", "so", "yet", "nor", "as", "if", "then", "than", "when", "while", "because", "though", "although",
+            // prepositions
+            "to", "of", "in", "on", "at", "by", "for", "with", "from", "into", "over", "under", "after", "before", "seeing",
+            // determiners
+            "this", "that", "these", "those", "some", "any", "all", "each", "every", "no",
+            // common sentence openers
+            "suddenly", "finally", "however", "meanwhile", "now", "here", "there", "just", "still", "also", "even", "only"
         )
 
         private val IRREGULAR_VERBS = setOf(
@@ -382,27 +497,8 @@ class TagAttributor(
             "just", "then", "suddenly", "gently", "softly", "quietly", "slowly", "calmly", "faintly"
         )
 
-        private val PRONOUNS = setOf(
-            "he", "she", "they", "it", "we", "i", "you",
-            "him", "her", "them", "us", "me",
-            "himself", "herself", "themselves", "itself",
-            "myself", "yourself", "ourselves",
-            "someone", "somebody", "everyone", "everybody",
-            "nobody", "no one", "who", "whoever", "whom", "whose", "which", "what"
-        )
-
-        private val NON_NAME_WORDS = setOf(
-            "a", "an", "the", "this", "that", "these", "those",
-            "some", "all", "every", "no", "any", "each", "either", "neither", "another",
-            "there", "here", "then", "now", "suddenly", "finally", "meanwhile",
-            "however", "instead", "still", "soon", "later", "again", "once",
-            "just", "even", "already", "perhaps", "maybe", "surely", "slowly",
-            "quickly", "quietly", "silently", "voice", "voices", "something",
-            "nothing", "anything", "everything"
-        )
-
         fun isPronoun(word: String): Boolean {
-            return PRONOUNS.contains(word.trim().lowercase())
+            return DEFAULT_STOPWORDS.contains(word.trim().lowercase())
         }
 
         fun isVerb(rawWord: String): Boolean {

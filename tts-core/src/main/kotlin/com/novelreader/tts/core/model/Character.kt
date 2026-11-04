@@ -29,7 +29,8 @@ data class Character(
     val voiceGender: VoiceGender = VoiceGender.ANY,
     val readByNarrator: Boolean = false,
     val speed: Float = DEFAULT_SPEED,
-    val pitch: Float = DEFAULT_PITCH
+    val pitch: Float = DEFAULT_PITCH,
+    val autoCreated: Boolean = false
 ) {
     /**
      * Built-in characters ("narrator" and "unnamed") are neither deletable

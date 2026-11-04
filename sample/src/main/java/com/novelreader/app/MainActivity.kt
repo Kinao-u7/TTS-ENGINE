@@ -1108,29 +1108,53 @@ fun CastTabContent(
             .fillMaxSize()
             .padding(16.dp)
     ) {
+        val autoCreatedCount = charactersList.count { it.autoCreated }
+
         // Header
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column {
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = "Character Cast",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "${charactersList.size} characters configured in this book",
+                    text = if (autoCreatedCount > 0) {
+                        "${charactersList.size} characters ($autoCreatedCount auto-created)"
+                    } else {
+                        "${charactersList.size} characters configured in this book"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.secondary
                 )
             }
 
-            Button(onClick = { showAddDialog = true }) {
-                Icon(Icons.Default.Add, contentDescription = "Add", modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(4.dp))
-                Text("Add Character")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (autoCreatedCount > 0) {
+                    OutlinedButton(
+                        onClick = {
+                            scope.launch {
+                                castStore.removeAutoCreatedCharacters(STABLE_BOOK_ID)
+                                if (chapterInputText.isNotBlank()) {
+                                    processAndLoadChapter(chapterInputText)
+                                }
+                            }
+                        },
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                    ) {
+                        Text("Remove auto-created")
+                    }
+                }
+
+                Button(onClick = { showAddDialog = true }) {
+                    Icon(Icons.Default.Add, contentDescription = "Add", modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Add")
+                }
             }
         }
 
@@ -1222,6 +1246,13 @@ fun CastTabContent(
                                         text = "(Built-in)",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.primary
+                                    )
+                                } else if (char.autoCreated) {
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "(Auto-created)",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.tertiary
                                     )
                                 }
                             }
@@ -1488,7 +1519,8 @@ fun CastTabContent(
                                 voiceGender = selectedGender,
                                 speed = editedSpeed,
                                 pitch = editedPitch,
-                                readByNarrator = readByNarrator
+                                readByNarrator = readByNarrator,
+                                autoCreated = false
                             )
                             scope.launch {
                                 castStore.saveCharacter(STABLE_BOOK_ID, updated)

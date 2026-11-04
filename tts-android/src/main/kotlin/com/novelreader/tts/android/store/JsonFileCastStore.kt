@@ -223,6 +223,36 @@ class JsonFileCastStore(
         }
     }
 
+    override suspend fun removeAutoCreatedCharacters(bookId: String) {
+        withContext(ioDispatcher) {
+            mutex.withLock {
+                val bookData = loadOrCreateBookData(bookId)
+                val autoChars = bookData.characters.values.filter { it.autoCreated && it.isDeletable }
+                if (autoChars.isEmpty()) return@withLock
+
+                for (char in autoChars) {
+                    bookData.ignoredNames.add(char.name.trim().lowercase())
+                    char.aliases.forEach { bookData.ignoredNames.add(it.trim().lowercase()) }
+                    bookData.characters.remove(char.id)
+
+                    bookData.overrides.values.forEach { chapterMap ->
+                        val iterator = chapterMap.entries.iterator()
+                        while (iterator.hasNext()) {
+                            if (iterator.next().value == char.id) {
+                                iterator.remove()
+                            }
+                        }
+                    }
+                }
+
+                ensureBuiltInsExist(bookData.characters)
+                saveBookDataToDisk(bookId, bookData)
+                val flow = getOrCreateFlowLocked(bookId)
+                flow.value = bookData.characters.values.toList()
+            }
+        }
+    }
+
     private fun saveBookDataToDisk(bookId: String, data: BookData) {
         if (!baseDir.exists()) {
             baseDir.mkdirs()
@@ -268,7 +298,8 @@ class JsonFileCastStore(
             sb.append("      \"voiceGender\": ").append(escapeJsonString(char.voiceGender.name)).append(",\n")
             sb.append("      \"readByNarrator\": ").append(char.readByNarrator).append(",\n")
             sb.append("      \"speed\": ").append(char.speed).append(",\n")
-            sb.append("      \"pitch\": ").append(char.pitch).append("\n")
+            sb.append("      \"pitch\": ").append(char.pitch).append(",\n")
+            sb.append("      \"autoCreated\": ").append(char.autoCreated).append("\n")
             sb.append("    }")
             if (index < chars.size - 1) sb.append(",")
             sb.append("\n")
@@ -344,6 +375,7 @@ class JsonFileCastStore(
                 val readByNarrator = (item["readByNarrator"] as? Boolean) ?: false
                 val speed = ((item["speed"] as? Number)?.toFloat()) ?: Character.DEFAULT_SPEED
                 val pitch = ((item["pitch"] as? Number)?.toFloat()) ?: Character.DEFAULT_PITCH
+                val autoCreated = (item["autoCreated"] as? Boolean) ?: false
 
                 charactersMap[id] = Character(
                     id = id,
@@ -353,7 +385,8 @@ class JsonFileCastStore(
                     voiceGender = gender,
                     readByNarrator = readByNarrator,
                     speed = speed,
-                    pitch = pitch
+                    pitch = pitch,
+                    autoCreated = autoCreated
                 )
             }
         }
