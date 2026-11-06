@@ -22,4 +22,5 @@ dependencyResolutionManagement {
 rootProject.name = "NovelReaderTTS"
 include(":tts-core")
 include(":tts-android")
+include(":tts-ui")
 include(":sample")

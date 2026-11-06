@@ -2,10 +2,15 @@
 
 package com.novelreader.app
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -20,15 +25,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowDropDown
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Pause
@@ -37,38 +36,25 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Warning
-import com.novelreader.tts.android.service.AudioFocusMode
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -82,124 +68,21 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.lifecycle.lifecycleScope
-import com.novelreader.tts.android.engine.SystemTtsEngine
-import com.novelreader.tts.android.store.JsonFileCastStore
-import com.novelreader.tts.core.engine.SpeechEvent
+import androidx.core.content.ContextCompat
+import com.novelreader.tts.android.MultiVoiceReader
+import com.novelreader.tts.android.service.AudioFocusMode
 import com.novelreader.tts.core.model.Character
-import com.novelreader.tts.core.model.CharacterResolver
 import com.novelreader.tts.core.model.Segment
 import com.novelreader.tts.core.model.SegmentType
-import com.novelreader.tts.core.model.VoiceGender
-import com.novelreader.tts.core.model.VoiceInfo
-import com.novelreader.tts.core.model.VoiceSelector
-import com.novelreader.tts.core.model.VoiceSettings
-import com.novelreader.tts.core.playback.PlaybackController
 import com.novelreader.tts.core.segmenter.NovelSegmenter
-import com.novelreader.tts.core.segmenter.TagAttributor
-import com.novelreader.tts.core.store.CastStore
-import com.novelreader.tts.core.store.PositionStore
-import com.novelreader.tts.core.store.ReadingPositionHelper
-import com.novelreader.tts.android.service.TtsPlaybackService
-import android.Manifest
-import android.content.ComponentName
-import android.content.Intent
-import android.content.ServiceConnection
-import android.content.pm.PackageManager
-import android.os.Build
-import android.os.IBinder
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.core.content.ContextCompat
+import com.novelreader.tts.ui.AddCharacterDialog
+import com.novelreader.tts.ui.AssignSpeakerSheet
+import com.novelreader.tts.ui.AudioSettingsSheet
+import com.novelreader.tts.ui.CastScreen
+import com.novelreader.tts.ui.CharacterEditSheet
+import com.novelreader.tts.ui.SpeakerChip
 import kotlinx.coroutines.launch
 import java.util.Locale
-
-class MainActivity : ComponentActivity() {
-
-    private var serviceBinder by mutableStateOf<TtsPlaybackService.LocalBinder?>(null)
-    private lateinit var castStore: CastStore
-    private val debugTracker = TtsDebugTracker()
-
-    private val serviceConnection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            serviceBinder = service as? TtsPlaybackService.LocalBinder
-        }
-
-        override fun onServiceDisconnected(name: ComponentName?) {
-            serviceBinder = null
-        }
-    }
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-
-        castStore = JsonFileCastStore(this)
-
-        val serviceIntent = Intent(this, TtsPlaybackService::class.java)
-        bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
-
-        setContent {
-            MaterialTheme {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
-                ) {
-                    val binder = serviceBinder
-                    if (binder != null) {
-                        // Wire debug instrumentation to TTS engine speech events
-                        LaunchedEffect(binder) {
-                            binder.ttsEngine.events.collect { event ->
-                                when (event) {
-                                    is SpeechEvent.Started -> {
-                                        val activeSpeaker = binder.controller.readerState.value.currentSpeaker?.id ?: "unknown"
-                                        val activeVoice = binder.controller.readerState.value.activeVoiceName
-                                            ?: binder.controller.readerState.value.currentSpeaker?.voiceName
-                                        debugTracker.onStart(event.utteranceId, activeSpeaker, activeVoice)
-                                    }
-                                    is SpeechEvent.Done -> {
-                                        val activeSpeaker = binder.controller.readerState.value.currentSpeaker?.id ?: "unknown"
-                                        debugTracker.onDone(event.utteranceId, activeSpeaker)
-                                    }
-                                    else -> {}
-                                }
-                            }
-                        }
-
-                        MainAppScaffold(
-                            ttsEngine = binder.ttsEngine,
-                            controller = binder.controller,
-                            positionStore = binder.positionStore,
-                            serviceBinder = binder,
-                            castStore = castStore,
-                            debugTracker = debugTracker,
-                            onPlayClicked = {
-                                val isWarm = binder.ttsEngine.isReady.value
-                                debugTracker.onPlay(isWarm)
-                                val startIntent = Intent(this@MainActivity, TtsPlaybackService::class.java).apply {
-                                    action = TtsPlaybackService.ACTION_START_FOREGROUND
-                                }
-                                ContextCompat.startForegroundService(this@MainActivity, startIntent)
-                                binder.play()
-                            }
-                        )
-                    } else {
-                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            Text(text = "Connecting to TTS Playback Service...", style = MaterialTheme.typography.bodyMedium)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        try {
-            unbindService(serviceConnection)
-        } catch (_: Exception) {}
-        // The service owns the controller and ttsEngine and manages its own lifecycle.
-    }
-}
 
 private const val STABLE_BOOK_ID = "test_book"
 
@@ -208,28 +91,48 @@ fun deriveChapterId(text: String): String {
     return "ch_$hash"
 }
 
-fun formatReadableLocale(localeTag: String): String {
-    return try {
-        val tag = localeTag.replace('_', '-')
-        val locale = Locale.forLanguageTag(tag)
-        val lang = locale.getDisplayLanguage(Locale.ENGLISH)
-        val country = locale.getDisplayCountry(Locale.ENGLISH)
-        if (country.isNotBlank()) "$lang ($country)" else if (lang.isNotBlank()) lang else localeTag
-    } catch (_: Exception) {
-        localeTag
+@Composable
+fun NovelReaderTheme(content: @Composable () -> Unit) {
+    MaterialTheme(content = content)
+}
+
+/**
+ * Main application activity acting as a thin shell connecting [MultiVoiceReader] and `:tts-ui`.
+ */
+class MainActivity : ComponentActivity() {
+
+    private lateinit var reader: MultiVoiceReader
+    private val debugTracker = TtsDebugTracker()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        reader = MultiVoiceReader(this)
+
+        setContent {
+            NovelReaderTheme {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    MainAppScaffold(
+                        reader = reader,
+                        debugTracker = debugTracker
+                    )
+                }
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        reader.release()
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainAppScaffold(
-    ttsEngine: SystemTtsEngine,
-    controller: PlaybackController,
-    positionStore: PositionStore,
-    serviceBinder: TtsPlaybackService.LocalBinder?,
-    castStore: CastStore,
-    debugTracker: TtsDebugTracker,
-    onPlayClicked: () -> Unit
+    reader: MultiVoiceReader,
+    debugTracker: TtsDebugTracker
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("novel_reader_prefs", Context.MODE_PRIVATE) }
@@ -238,8 +141,11 @@ fun MainAppScaffold(
     var selectedTab by remember { mutableIntStateOf(0) }
     var autoDetectSpeakers by remember { mutableStateOf(prefs.getBoolean("auto_detect_speakers", true)) }
 
-    val charactersList by castStore.characters(STABLE_BOOK_ID).collectAsState(initial = emptyList())
-    var availableVoices by remember { mutableStateOf<List<VoiceInfo>>(emptyList()) }
+    val readerState by reader.readerState.collectAsState()
+    val charactersList by reader.characters.collectAsState(initial = emptyList())
+    val segments by reader.segments.collectAsState()
+    val availableVoices by reader.availableVoices.collectAsState()
+    val resumedFromSentence by reader.resumedFromSentence.collectAsState()
 
     // Notification permission check on Android 13+
     var hasNotificationPermission by remember {
@@ -263,6 +169,9 @@ fun MainAppScaffold(
     }
 
     var showSettingsSheet by remember { mutableStateOf(false) }
+    var segmentForSpeakerSheet by remember { mutableStateOf<Segment?>(null) }
+    var characterToEdit by remember { mutableStateOf<Character?>(null) }
+    var showAddCharacterDialog by remember { mutableStateOf(false) }
 
     var audioFocusMode by remember {
         val saved = prefs.getString("audio_focus_mode", AudioFocusMode.PAUSE_OTHERS.name)
@@ -274,177 +183,36 @@ fun MainAppScaffold(
         mutableStateOf(prefs.getBoolean("keep_reading_when_other_audio_starts", false))
     }
 
-    LaunchedEffect(serviceBinder, audioFocusMode, keepReadingWhenOtherAudioStarts) {
-        serviceBinder?.setAudioFocusSettings(audioFocusMode, keepReadingWhenOtherAudioStarts)
+    LaunchedEffect(audioFocusMode, keepReadingWhenOtherAudioStarts, reader.isBound) {
+        reader.setAudioFocusSettings(audioFocusMode, keepReadingWhenOtherAudioStarts)
     }
 
-    // Remember the last pasted text across restarts (empty string on fresh launch)
+    // Persisted chapter input text
     var chapterInputText by remember {
         mutableStateOf(prefs.getString("last_pasted_text", "") ?: "")
     }
-    var segments by remember { mutableStateOf<List<Segment>>(emptyList()) }
-    var resumedFromSentence by remember { mutableStateOf<Int?>(null) }
-
-    val readerState by controller.readerState.collectAsState()
 
     val bookLocale = remember {
         prefs.getString("book_locale", Locale.getDefault().toLanguageTag()) ?: Locale.getDefault().toLanguageTag()
     }
 
-    // Sync characters with PlaybackController
-    LaunchedEffect(charactersList) {
-        if (charactersList.isNotEmpty()) {
-            controller.updateCharacters(charactersList)
-        }
+    LaunchedEffect(bookLocale) {
+        reader.bookLocale = bookLocale
     }
 
-    // Load available voices once TTS engine is ready and assign distinct voices on first run
-    LaunchedEffect(readerState.isReady) {
-        if (readerState.isReady) {
-            val deviceVoices = ttsEngine.getAvailableVoices().filter { !it.requiresNetwork }
-            availableVoices = deviceVoices
-            controller.updateAvailableVoices(deviceVoices)
-            controller.setBookLocale(bookLocale)
-
-            if (deviceVoices.isNotEmpty()) {
-                val currentChars = charactersList.ifEmpty {
-                    listOf(Character.Narrator, Character.Unnamed)
-                }
-
-                var narratorChar = currentChars.firstOrNull { it.id == Character.NARRATOR_ID } ?: Character.Narrator
-                var unnamedChar = currentChars.firstOrNull { it.id == Character.UNNAMED_ID } ?: Character.Unnamed
-                val usedVoiceIds = currentChars.mapNotNull { it.voiceId }.toMutableSet()
-                var needsSaveNarrator = false
-                var needsSaveUnnamed = false
-
-                if (narratorChar.voiceId == null) {
-                    val pickNarrator = VoiceSelector.pick(
-                        character = narratorChar,
-                        availableVoices = deviceVoices,
-                        usedVoices = usedVoiceIds,
-                        bookLocale = bookLocale
-                    )
-                    pickNarrator.voice?.id?.let {
-                        narratorChar = narratorChar.copy(voiceId = it)
-                        usedVoiceIds.add(it)
-                        needsSaveNarrator = true
-                    }
-                }
-
-                if (unnamedChar.voiceId == null) {
-                    val pickUnnamed = VoiceSelector.pick(
-                        character = unnamedChar,
-                        availableVoices = deviceVoices,
-                        usedVoices = usedVoiceIds,
-                        bookLocale = bookLocale,
-                        narratorVoiceId = narratorChar.voiceId
-                    )
-                    pickUnnamed.voice?.id?.let {
-                        unnamedChar = unnamedChar.copy(voiceId = it)
-                        usedVoiceIds.add(it)
-                        needsSaveUnnamed = true
-                    }
-                }
-
-                if (needsSaveNarrator) {
-                    castStore.saveCharacter(STABLE_BOOK_ID, narratorChar)
-                }
-                if (needsSaveUnnamed) {
-                    castStore.saveCharacter(STABLE_BOOK_ID, unnamedChar)
-                }
-            }
-
-            // Restore chapter text now that voices and engine are ready
-            if (chapterInputText.isNotBlank() && segments.isEmpty()) {
-                processAndLoadChapter(chapterInputText)
-            }
-        }
-    }
-
-    // Function to load and segment chapter, stopping playback, clearing old segments,
-    // running TagAttributor (setting speakerId only), auto-creating characters with distinct voices,
-    // and applying stored overrides based on the text hash chapterId.
-    fun processAndLoadChapter(textToLoad: String) {
+    fun loadChapterText(text: String) {
         scope.launch {
-            // Stop playback and clear previous segments completely
-            controller.stop()
-            segments = emptyList()
-            controller.loadSegments(emptyList())
-            resumedFromSentence = null
+            prefs.edit().putString("last_pasted_text", text).apply()
+            reader.autoDetectSpeakers = autoDetectSpeakers
+            val chapterId = deriveChapterId(text)
+            reader.loadChapter(STABLE_BOOK_ID, chapterId, text)
+        }
+    }
 
-            if (textToLoad.isBlank()) {
-                prefs.edit().putString("last_pasted_text", "").apply()
-                return@launch
-            }
-
-            // Persist the pasted text
-            prefs.edit().putString("last_pasted_text", textToLoad).apply()
-
-            // Derive chapterId from hash of the loaded text so overrides never collide
-            val chapterId = deriveChapterId(textToLoad)
-            serviceBinder?.setBookAndChapter(STABLE_BOOK_ID, chapterId, "Chapter ${chapterId.takeLast(6)}")
-
-            val rawSegments = NovelSegmenter.segment(textToLoad)
-            val currentChars = if (charactersList.isEmpty()) {
-                listOf(Character.Narrator, Character.Unnamed)
-            } else {
-                charactersList
-            }
-
-            val attributedSegments = if (autoDetectSpeakers) {
-                val ignoredNames = castStore.ignoredNames(STABLE_BOOK_ID)
-                val attribution = TagAttributor().attribute(rawSegments, currentChars, ignoredNames)
-
-                // For any newly created character from TagAttributor, pick a distinct voice once and save it
-                val usedVoiceIds = currentChars.mapNotNull { it.voiceId }.toMutableSet()
-                val narratorVoiceId = currentChars.firstOrNull { it.id == Character.NARRATOR_ID }?.voiceId
-
-                for (newChar in attribution.characters) {
-                    if (currentChars.none { it.id == newChar.id }) {
-                        val voiceResult = VoiceSelector.pick(
-                            character = newChar,
-                            availableVoices = availableVoices,
-                            usedVoices = usedVoiceIds,
-                            bookLocale = bookLocale,
-                            narratorVoiceId = narratorVoiceId
-                        )
-                        val charWithVoice = newChar.copy(voiceId = voiceResult.voice?.id)
-                        voiceResult.voice?.id?.let { usedVoiceIds.add(it) }
-                        castStore.saveCharacter(STABLE_BOOK_ID, charWithVoice)
-                    }
-                }
-                attribution.segments
-            } else {
-                rawSegments
-            }
-
-            // Load stored overrides for this book & chapterId
-            val overridesMap = castStore.overrides(STABLE_BOOK_ID, chapterId)
-
-            // Apply overrides as speakerOverride (ignoring non-existent segment IDs silently)
-            val finalSegments = attributedSegments.map { seg ->
-                val overrideId = overridesMap[seg.id]
-                if (overrideId != null) {
-                    seg.copy(speakerOverride = overrideId)
-                } else {
-                    seg
-                }
-            }
-
-            segments = finalSegments
-
-            // Retrieve saved reading position and clamp safely
-            val savedPosition = positionStore.getPosition(STABLE_BOOK_ID, chapterId)
-            controller.loadSegments(finalSegments)
-
-            if (savedPosition != null && savedPosition > 0) {
-                val sentenceCount = controller.readerState.value.sentenceCount
-                val clamped = ReadingPositionHelper.clampSentenceIndex(savedPosition, sentenceCount)
-                if (clamped > 0) {
-                    controller.jumpToSentence(clamped)
-                    resumedFromSentence = clamped
-                }
-            }
+    // Initial restore once engine becomes ready
+    LaunchedEffect(readerState.isReady) {
+        if (readerState.isReady && chapterInputText.isNotBlank() && segments.isEmpty()) {
+            loadChapterText(chapterInputText)
         }
     }
 
@@ -467,212 +235,153 @@ fun MainAppScaffold(
 
         Box(modifier = Modifier.weight(1f)) {
             if (selectedTab == 0) {
-                ReaderTabContent(
-                    controller = controller,
-                    castStore = castStore,
+                // Reader Screen
+                ReaderContent(
+                    reader = reader,
                     debugTracker = debugTracker,
-                    charactersList = charactersList,
-                    availableVoices = availableVoices,
                     chapterInputText = chapterInputText,
                     onChapterInputTextChange = { chapterInputText = it },
-                    segments = segments,
-                    onSegmentsChange = { segments = it },
-                    onLoadChapter = { processAndLoadChapter(it) },
-                    onPlayClicked = onPlayClicked,
-                    onPauseClicked = { serviceBinder?.pause() ?: controller.pause() },
+                    onLoadChapter = { loadChapterText(it) },
                     onOpenCastScreen = { selectedTab = 1 },
                     onOpenSettings = { showSettingsSheet = true },
-                    hasNotificationPermission = hasNotificationPermission,
-                    resumedFromSentence = resumedFromSentence,
-                    onRestartFromBeginning = {
-                        controller.jumpToSentence(0)
-                        resumedFromSentence = null
-                        val chapterId = deriveChapterId(chapterInputText)
-                        scope.launch {
-                            positionStore.clearPosition(STABLE_BOOK_ID, chapterId)
-                        }
-                    }
+                    onSelectSegmentForSpeaker = { segmentForSpeakerSheet = it },
+                    hasNotificationPermission = hasNotificationPermission
                 )
             } else {
-                CastTabContent(
-                    ttsEngine = ttsEngine,
-                    controller = controller,
-                    castStore = castStore,
-                    charactersList = charactersList,
+                // Cast Screen from :tts-ui
+                CastScreen(
+                    characters = charactersList,
                     availableVoices = availableVoices,
                     segments = segments,
                     autoDetectSpeakers = autoDetectSpeakers,
                     onAutoDetectSpeakersChange = { enabled ->
                         autoDetectSpeakers = enabled
                         prefs.edit().putBoolean("auto_detect_speakers", enabled).apply()
+                        reader.autoDetectSpeakers = enabled
                         if (chapterInputText.isNotBlank()) {
-                            processAndLoadChapter(chapterInputText)
+                            loadChapterText(chapterInputText)
                         }
                     },
-                    chapterInputText = chapterInputText,
-                    processAndLoadChapter = { processAndLoadChapter(it) }
+                    onCharacterClick = { characterToEdit = it },
+                    onAddCharacterClick = { showAddCharacterDialog = true },
+                    onRemoveAutoCreatedClick = {
+                        scope.launch {
+                            reader.removeAutoCreatedCharacters()
+                            if (chapterInputText.isNotBlank()) {
+                                loadChapterText(chapterInputText)
+                            }
+                        }
+                    },
+                    onPreviewVoice = { char -> reader.previewVoice(char) }
                 )
             }
         }
+    }
 
-        if (showSettingsSheet) {
-            val sheetState = rememberModalBottomSheetState()
-            ModalBottomSheet(
-                onDismissRequest = { showSettingsSheet = false },
-                sheetState = sheetState
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 20.dp, vertical = 12.dp)
-                ) {
-                    Text(
-                        text = "Audio Focus Settings",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    Text(
-                        text = "When other audio is playing",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    val modes = listOf(
-                        Triple(
-                            AudioFocusMode.PAUSE_OTHERS,
-                            "Pause others (default)",
-                            "Pause other apps while reading (AUDIOFOCUS_GAIN)"
-                        ),
-                        Triple(
-                            AudioFocusMode.DUCK_OTHERS,
-                            "Duck others",
-                            "Lower other audio volume across sentences (AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)"
-                        ),
-                        Triple(
-                            AudioFocusMode.MIX,
-                            "Mix",
-                            "Play alongside other audio without requesting focus"
-                        )
-                    )
-
-                    modes.forEach { (modeOption, title, description) ->
-                        val isSelected = audioFocusMode == modeOption
-                        Card(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 4.dp)
-                                .clickable {
-                                    audioFocusMode = modeOption
-                                    prefs.edit().putString("audio_focus_mode", modeOption.name).apply()
-                                    serviceBinder?.setAudioFocusSettings(modeOption, keepReadingWhenOtherAudioStarts)
-                                },
-                            colors = CardDefaults.cardColors(
-                                containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-                            )
-                        ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(12.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = title,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold
-                                    )
-                                    Text(
-                                        text = description,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.secondary
-                                    )
-                                }
-                                if (isSelected) {
-                                    Icon(
-                                        Icons.Default.Check,
-                                        contentDescription = "Selected",
-                                        tint = MaterialTheme.colorScheme.primary
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(12.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "Keep reading when other audio starts",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = "Ignore focus loss from other apps. Always pauses for phone calls and ringtones.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.secondary
-                                )
-                            }
-                            Spacer(modifier = Modifier.width(12.dp))
-                            Switch(
-                                checked = keepReadingWhenOtherAudioStarts,
-                                onCheckedChange = { checked ->
-                                    keepReadingWhenOtherAudioStarts = checked
-                                    prefs.edit().putBoolean("keep_reading_when_other_audio_starts", checked).apply()
-                                    serviceBinder?.setAudioFocusSettings(audioFocusMode, checked)
-                                }
-                            )
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(24.dp))
+    // Assign Speaker Bottom Sheet from :tts-ui
+    segmentForSpeakerSheet?.let { segment ->
+        AssignSpeakerSheet(
+            segmentText = segment.text,
+            characters = charactersList,
+            availableVoices = availableVoices,
+            selectedSpeakerId = segment.effectiveSpeakerId,
+            onSpeakerSelected = { char ->
+                scope.launch {
+                    reader.assignSpeaker(segment.id, char.id)
                 }
-            }
-        }
+                segmentForSpeakerSheet = null
+            },
+            onDismissRequest = { segmentForSpeakerSheet = null }
+        )
+    }
+
+    // Edit Character Bottom Sheet from :tts-ui
+    characterToEdit?.let { char ->
+        CharacterEditSheet(
+            character = char,
+            availableVoices = availableVoices,
+            onSave = { updated ->
+                scope.launch {
+                    reader.saveCharacter(updated)
+                    if (chapterInputText.isNotBlank()) {
+                        loadChapterText(chapterInputText)
+                    }
+                }
+                characterToEdit = null
+            },
+            onDelete = if (char.isDeletable) {
+                {
+                    scope.launch {
+                        reader.deleteCharacter(char.id)
+                        if (chapterInputText.isNotBlank()) {
+                            loadChapterText(chapterInputText)
+                        }
+                    }
+                    characterToEdit = null
+                }
+            } else null,
+            onDismissRequest = { characterToEdit = null },
+            onPreviewVoice = { c -> reader.previewVoice(c) }
+        )
+    }
+
+    // Add Character Dialog from :tts-ui
+    if (showAddCharacterDialog) {
+        AddCharacterDialog(
+            onAdd = { newChar ->
+                scope.launch {
+                    reader.saveCharacter(newChar)
+                    if (chapterInputText.isNotBlank()) {
+                        loadChapterText(chapterInputText)
+                    }
+                }
+                showAddCharacterDialog = false
+            },
+            onDismissRequest = { showAddCharacterDialog = false }
+        )
+    }
+
+    // Audio Focus Settings Bottom Sheet from :tts-ui
+    if (showSettingsSheet) {
+        AudioSettingsSheet(
+            audioFocusMode = audioFocusMode,
+            keepReadingWhenOtherAudioStarts = keepReadingWhenOtherAudioStarts,
+            onModeSelected = { mode ->
+                audioFocusMode = mode
+                prefs.edit().putString("audio_focus_mode", mode.name).apply()
+                reader.setAudioFocusSettings(mode, keepReadingWhenOtherAudioStarts)
+            },
+            onKeepReadingChanged = { keepReading ->
+                keepReadingWhenOtherAudioStarts = keepReading
+                prefs.edit().putBoolean("keep_reading_when_other_audio_starts", keepReading).apply()
+                reader.setAudioFocusSettings(audioFocusMode, keepReading)
+            },
+            onDismissRequest = { showSettingsSheet = false }
+        )
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+/**
+ * Reader tab UI shell displaying chapter text, highlights, attribution stats, and playback controls.
+ */
 @Composable
-fun ReaderTabContent(
-    controller: PlaybackController,
-    castStore: CastStore,
+fun ReaderContent(
+    reader: MultiVoiceReader,
     debugTracker: TtsDebugTracker,
-    charactersList: List<Character>,
-    availableVoices: List<VoiceInfo>,
     chapterInputText: String,
     onChapterInputTextChange: (String) -> Unit,
-    segments: List<Segment>,
-    onSegmentsChange: (List<Segment>) -> Unit,
     onLoadChapter: (String) -> Unit,
-    onPlayClicked: () -> Unit,
-    onPauseClicked: () -> Unit = {},
     onOpenCastScreen: () -> Unit,
-    onOpenSettings: () -> Unit = {},
-    hasNotificationPermission: Boolean = true,
-    resumedFromSentence: Int? = null,
-    onRestartFromBeginning: () -> Unit = {}
+    onOpenSettings: () -> Unit,
+    onSelectSegmentForSpeaker: (Segment) -> Unit,
+    hasNotificationPermission: Boolean
 ) {
-    val readerState by controller.readerState.collectAsState()
+    val readerState by reader.readerState.collectAsState()
+    val segments by reader.segments.collectAsState()
+    val availableVoices by reader.availableVoices.collectAsState()
+    val charactersList by reader.characters.collectAsState(initial = emptyList())
+    val resumedFromSentence by reader.resumedFromSentence.collectAsState()
     val debugMetrics by debugTracker.metrics.collectAsState()
-    val scope = rememberCoroutineScope()
-
-    var segmentForSpeakerSheet by remember { mutableStateOf<Segment?>(null) }
 
     val dialogueSegments = segments.filter { it.type == SegmentType.DIALOGUE }
     val autoAssignedCount = dialogueSegments.count { it.speakerId != null }
@@ -703,22 +412,8 @@ fun ReaderTabContent(
             }
 
             Row(verticalAlignment = Alignment.CenterVertically) {
-                // Current Speaker Chip
-                readerState.currentSpeaker?.let { speaker ->
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(MaterialTheme.colorScheme.primaryContainer)
-                            .padding(horizontal = 12.dp, vertical = 6.dp)
-                    ) {
-                        Text(
-                            text = "Speaker: ${speaker.displayName}",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                }
+                // SpeakerChip from :tts-ui
+                SpeakerChip(speaker = readerState.currentSpeaker)
 
                 Spacer(modifier = Modifier.width(4.dp))
 
@@ -730,16 +425,13 @@ fun ReaderTabContent(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Error Banner
+        // Warning Banners
         if (readerState.isReady && availableVoices.isEmpty()) {
             OutlinedCard(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.outlinedCardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
             ) {
-                Row(
-                    modifier = Modifier.padding(10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Default.Warning, contentDescription = "Error", tint = MaterialTheme.colorScheme.onErrorContainer)
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
@@ -758,10 +450,7 @@ fun ReaderTabContent(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.outlinedCardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
             ) {
-                Row(
-                    modifier = Modifier.padding(10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Default.Warning, contentDescription = "Missing voice", tint = MaterialTheme.colorScheme.onErrorContainer)
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
@@ -775,7 +464,7 @@ fun ReaderTabContent(
             Spacer(modifier = Modifier.height(8.dp))
         }
 
-        // Debug Panel & Dialogue Attribution Stats
+        // Attribution & Latency Debug Stats
         OutlinedCard(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.outlinedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
@@ -804,7 +493,6 @@ fun ReaderTabContent(
                     )
                 }
                 Spacer(modifier = Modifier.height(4.dp))
-                // Debug line showing how many dialogue lines were auto-assigned vs Unnamed
                 Text(
                     text = "Dialogue: $autoAssignedCount auto-assigned, $unnamedCount Unnamed (${dialogueSegments.size} total)",
                     style = MaterialTheme.typography.bodySmall,
@@ -858,7 +546,7 @@ fun ReaderTabContent(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Subtle inline hint if notification permission is unavailable
+        // Notification hint
         if (!hasNotificationPermission) {
             Text(
                 text = "Notification controls unavailable (notification permission not granted)",
@@ -868,7 +556,7 @@ fun ReaderTabContent(
             Spacer(modifier = Modifier.height(6.dp))
         }
 
-        // Resumed reading position indicator
+        // Reading position resumption badge
         if (resumedFromSentence != null) {
             Row(
                 modifier = Modifier
@@ -880,13 +568,13 @@ fun ReaderTabContent(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Resumed at sentence ${resumedFromSentence + 1}",
+                    text = "Resumed at sentence ${resumedFromSentence!! + 1}",
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onPrimaryContainer
                 )
                 TextButton(
-                    onClick = onRestartFromBeginning,
+                    onClick = { reader.jumpToSentence(0) },
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp)
                 ) {
                     Text("Start Over", style = MaterialTheme.typography.labelSmall)
@@ -943,7 +631,7 @@ fun ReaderTabContent(
                             .clip(RoundedCornerShape(8.dp))
                             .then(
                                 if (segment.type == SegmentType.DIALOGUE) {
-                                    Modifier.clickable { segmentForSpeakerSheet = segment }
+                                    Modifier.clickable { onSelectSegmentForSpeaker(segment) }
                                 } else {
                                     Modifier
                                 }
@@ -1014,7 +702,7 @@ fun ReaderTabContent(
             horizontalArrangement = Arrangement.Center,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(onClick = { controller.previous() }) {
+            IconButton(onClick = { reader.previous() }) {
                 Icon(Icons.Default.SkipPrevious, contentDescription = "Previous")
             }
 
@@ -1022,11 +710,9 @@ fun ReaderTabContent(
 
             FloatingActionButton(
                 onClick = {
-                    if (readerState.isPlaying) {
-                        onPauseClicked()
-                    } else {
-                        onPlayClicked()
-                    }
+                    val isWarm = reader.readerState.value.isReady
+                    debugTracker.onPlay(isWarm)
+                    reader.togglePlayPause()
                 }
             ) {
                 Icon(
@@ -1037,631 +723,9 @@ fun ReaderTabContent(
 
             Spacer(modifier = Modifier.width(16.dp))
 
-            IconButton(onClick = { controller.next() }) {
+            IconButton(onClick = { reader.next() }) {
                 Icon(Icons.Default.SkipNext, contentDescription = "Next")
             }
         }
     }
-
-    // Modal Bottom Sheet for Speaker Assignment
-    if (segmentForSpeakerSheet != null) {
-        val targetSegment = segmentForSpeakerSheet!!
-        val sheetState = rememberModalBottomSheetState()
-        val chapterId = deriveChapterId(chapterInputText)
-
-        ModalBottomSheet(
-            onDismissRequest = { segmentForSpeakerSheet = null },
-            sheetState = sheetState
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 12.dp)
-            ) {
-                Text(
-                    text = "Assign Speaker to Dialogue",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = targetSegment.text,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.secondary
-                )
-                Spacer(modifier = Modifier.height(16.dp))
-
-                LazyColumn {
-                    items(charactersList) { char ->
-                        val isSelected = targetSegment.effectiveSpeakerId == char.id
-
-                        Card(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 4.dp)
-                                .clickable {
-                                    scope.launch {
-                                        castStore.setOverride(STABLE_BOOK_ID, chapterId, targetSegment.id, char.id)
-                                    }
-                                    controller.reassignSpeaker(targetSegment.id, char.id, isOverride = true)
-                                    val updated = segments.map {
-                                        if (it.id == targetSegment.id) it.copy(speakerOverride = char.id) else it
-                                    }
-                                    onSegmentsChange(updated)
-                                    controller.playSegment(targetSegment.id)
-                                    segmentForSpeakerSheet = null
-                                },
-                            colors = CardDefaults.cardColors(
-                                containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
-                            )
-                        ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(12.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column {
-                                    Text(
-                                        text = char.name,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                    val assignedVoice = availableVoices.firstOrNull { it.id == char.voiceId }
-                                    Text(
-                                        text = if (char.readByNarrator) {
-                                            "Read by Narrator"
-                                        } else {
-                                            "Voice: ${assignedVoice?.let { "${it.name} (${formatReadableLocale(it.locale)})" } ?: "Auto-assigned"}"
-                                        },
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.secondary
-                                    )
-                                }
-                                if (isSelected) {
-                                    Icon(
-                                        Icons.Default.Check,
-                                        contentDescription = "Selected",
-                                        tint = MaterialTheme.colorScheme.primary
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-                Spacer(modifier = Modifier.height(20.dp))
-            }
-        }
-    }
 }
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun CastTabContent(
-    ttsEngine: SystemTtsEngine,
-    controller: PlaybackController,
-    castStore: CastStore,
-    charactersList: List<Character>,
-    availableVoices: List<VoiceInfo>,
-    segments: List<Segment>,
-    autoDetectSpeakers: Boolean,
-    onAutoDetectSpeakersChange: (Boolean) -> Unit,
-    chapterInputText: String,
-    processAndLoadChapter: (String) -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    var characterToEdit by remember { mutableStateOf<Character?>(null) }
-    var showAddDialog by remember { mutableStateOf(false) }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp)
-    ) {
-        val autoCreatedCount = charactersList.count { it.autoCreated }
-
-        // Header
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = "Character Cast",
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = if (autoCreatedCount > 0) {
-                        "${charactersList.size} characters ($autoCreatedCount auto-created)"
-                    } else {
-                        "${charactersList.size} characters configured in this book"
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.secondary
-                )
-            }
-
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                if (autoCreatedCount > 0) {
-                    OutlinedButton(
-                        onClick = {
-                            scope.launch {
-                                castStore.removeAutoCreatedCharacters(STABLE_BOOK_ID)
-                                if (chapterInputText.isNotBlank()) {
-                                    processAndLoadChapter(chapterInputText)
-                                }
-                            }
-                        },
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
-                    ) {
-                        Text("Remove auto-created")
-                    }
-                }
-
-                Button(onClick = { showAddDialog = true }) {
-                    Icon(Icons.Default.Add, contentDescription = "Add", modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Add")
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(10.dp))
-
-        // Auto-detect speakers toggle card
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(12.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "Auto-detect speakers",
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = "Infer speaker from dialogue tags (e.g. said Xian)",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.secondary
-                    )
-                }
-                Switch(
-                    checked = autoDetectSpeakers,
-                    onCheckedChange = onAutoDetectSpeakersChange
-                )
-            }
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        // Characters List
-        LazyColumn(
-            modifier = Modifier.fillMaxSize(),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            items(charactersList) { char ->
-                val lineCount = segments.count { it.effectiveSpeakerId == char.id }
-                val assignedVoice = availableVoices.firstOrNull { it.id == char.voiceId }
-
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { characterToEdit = char },
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        // Avatar Initial
-                        Box(
-                            modifier = Modifier
-                                .size(44.dp)
-                                .clip(CircleShape)
-                                .background(MaterialTheme.colorScheme.primaryContainer),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = char.name.firstOrNull()?.uppercase() ?: "?",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.width(12.dp))
-
-                        // Character details
-                        Column(modifier = Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = char.name,
-                                    style = MaterialTheme.typography.bodyLarge,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                if (char.isBuiltIn) {
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = "(Built-in)",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.primary
-                                    )
-                                } else if (char.autoCreated) {
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = "(Auto-created)",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.tertiary
-                                    )
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.height(2.dp))
-
-                            val voiceDesc = if (char.readByNarrator) {
-                                "Read by Narrator"
-                            } else if (assignedVoice != null) {
-                                "${assignedVoice.name} (${formatReadableLocale(assignedVoice.locale)})"
-                            } else {
-                                "Auto-assigned (${char.voiceGender.name})"
-                            }
-
-                            Text(
-                                text = "$voiceDesc • $lineCount ${if (lineCount == 1) "line" else "lines"} • ${char.speed}x speed",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.secondary
-                            )
-                        }
-
-                        // Preview Play ▶ Button
-                        IconButton(
-                            onClick = {
-                                val usedVoiceIds = charactersList.mapNotNull { it.voiceId }.toSet()
-                                val narratorVoiceId = charactersList.firstOrNull { it.id == Character.NARRATOR_ID }?.voiceId
-                                val voiceResult = VoiceSelector.pick(
-                                    character = char,
-                                    availableVoices = availableVoices,
-                                    usedVoices = usedVoiceIds,
-                                    bookLocale = "en-US",
-                                    narratorVoiceId = narratorVoiceId
-                                )
-                                val settings = VoiceSettings.getSettings(char)
-                                val previewText = "Hello, I am ${char.name}."
-                                ttsEngine.speak(previewText, voice = voiceResult.voice, settings = settings, utteranceId = "preview_${char.id}")
-                            }
-                        ) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = "Preview voice", tint = MaterialTheme.colorScheme.primary)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Edit Character Sheet
-    if (characterToEdit != null) {
-        val char = characterToEdit!!
-        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-
-        var editedName by remember(char.id) { mutableStateOf(char.name) }
-        var selectedVoiceId by remember(char.id) { mutableStateOf(char.voiceId) }
-        var selectedGender by remember(char.id) { mutableStateOf(char.voiceGender) }
-        var editedSpeed by remember(char.id) { mutableFloatStateOf(char.speed) }
-        var editedPitch by remember(char.id) { mutableFloatStateOf(char.pitch) }
-        var readByNarrator by remember(char.id) { mutableStateOf(char.readByNarrator) }
-        var showVoiceDropdown by remember(char.id) { mutableStateOf(false) }
-
-        ModalBottomSheet(
-            onDismissRequest = { characterToEdit = null },
-            sheetState = sheetState
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 12.dp)
-            ) {
-                Text(
-                    text = if (char.isBuiltIn) "Edit ${char.name} Settings" else "Edit Character",
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold
-                )
-
-                Spacer(modifier = Modifier.height(12.dp))
-
-                // Name field
-                OutlinedTextField(
-                    value = editedName,
-                    onValueChange = { if (!char.isBuiltIn) editedName = it },
-                    label = { Text("Name") },
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = !char.isBuiltIn,
-                    supportingText = {
-                        if (char.isBuiltIn) Text("Built-in character names cannot be changed")
-                    }
-                )
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Voice Picker
-                Text(
-                    text = "Assigned Voice",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-
-                val currentSelectedVoice = availableVoices.firstOrNull { it.id == selectedVoiceId }
-                Box(modifier = Modifier.fillMaxWidth()) {
-                    OutlinedCard(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { showVoiceDropdown = true }
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(12.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = currentSelectedVoice?.let { "${it.name} (${formatReadableLocale(it.locale)})" } ?: "Auto-assigned (matches gender)",
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                            Icon(Icons.Default.ArrowDropDown, contentDescription = "Select voice")
-                        }
-                    }
-
-                    DropdownMenu(
-                        expanded = showVoiceDropdown,
-                        onDismissRequest = { showVoiceDropdown = false }
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("Auto-assign (Default)") },
-                            onClick = {
-                                selectedVoiceId = null
-                                showVoiceDropdown = false
-                            }
-                        )
-                        availableVoices.forEach { voice ->
-                            DropdownMenuItem(
-                                text = {
-                                    Column {
-                                        Text(text = voice.name, fontWeight = FontWeight.SemiBold)
-                                        Text(
-                                            text = formatReadableLocale(voice.locale),
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.secondary
-                                        )
-                                    }
-                                },
-                                onClick = {
-                                    selectedVoiceId = voice.id
-                                    showVoiceDropdown = false
-                                }
-                            )
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Voice Gender
-                Text(
-                    text = "Voice Gender Preference",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    listOf(VoiceGender.ANY, VoiceGender.MALE, VoiceGender.FEMALE).forEach { gender ->
-                        FilterChip(
-                            selected = selectedGender == gender,
-                            onClick = { selectedGender = gender },
-                            label = { Text(gender.name) }
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Speed Slider
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(text = "Speed", style = MaterialTheme.typography.labelMedium)
-                    Text(text = String.format(Locale.US, "%.1fx", editedSpeed), style = MaterialTheme.typography.bodySmall)
-                }
-                Slider(
-                    value = editedSpeed,
-                    onValueChange = { editedSpeed = it },
-                    valueRange = 0.5f..2.0f,
-                    steps = 14
-                )
-
-                // Pitch Slider
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(text = "Pitch", style = MaterialTheme.typography.labelMedium)
-                    Text(text = String.format(Locale.US, "%.1fx", editedPitch), style = MaterialTheme.typography.bodySmall)
-                }
-                Slider(
-                    value = editedPitch,
-                    onValueChange = { editedPitch = it },
-                    valueRange = 0.5f..2.0f,
-                    steps = 14
-                )
-
-                // Read by Narrator toggle
-                if (char.id != Character.NARRATOR_ID) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(text = "Read by narrator", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
-                            Text(text = "Lines spoken by this character will use the narrator's voice", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
-                        }
-                        Switch(
-                            checked = readByNarrator,
-                            onCheckedChange = { readByNarrator = it }
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // Bottom Actions: Delete (if not built-in) and Save
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    if (char.isDeletable) {
-                        OutlinedButton(
-                            onClick = {
-                                scope.launch {
-                                    castStore.deleteCharacter(STABLE_BOOK_ID, char.id)
-                                    if (chapterInputText.isNotBlank()) {
-                                        processAndLoadChapter(chapterInputText)
-                                    }
-                                }
-                                characterToEdit = null
-                            },
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Icon(Icons.Default.Delete, contentDescription = "Delete", modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Delete")
-                        }
-                    }
-
-                    Button(
-                        onClick = {
-                            val trimmedNewName = editedName.trim()
-                            val updatedAliases = if (!trimmedNewName.equals(char.name, ignoreCase = true)) {
-                                (char.aliases + char.name).distinctBy { it.lowercase() }
-                            } else {
-                                char.aliases
-                            }
-                            val updated = char.copy(
-                                name = trimmedNewName,
-                                aliases = updatedAliases,
-                                voiceId = selectedVoiceId,
-                                voiceGender = selectedGender,
-                                speed = editedSpeed,
-                                pitch = editedPitch,
-                                readByNarrator = readByNarrator,
-                                autoCreated = false
-                            )
-                            scope.launch {
-                                castStore.saveCharacter(STABLE_BOOK_ID, updated)
-                                if (chapterInputText.isNotBlank()) {
-                                    processAndLoadChapter(chapterInputText)
-                                }
-                            }
-                            controller.updateCharacters(charactersList.map { if (it.id == updated.id) updated else it })
-                            characterToEdit = null
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("Save Changes")
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(20.dp))
-            }
-        }
-    }
-
-    // Add Character Dialog
-    if (showAddDialog) {
-        var newName by remember { mutableStateOf("") }
-        var newVoiceId by remember { mutableStateOf<String?>(null) }
-        var newGender by remember { mutableStateOf(VoiceGender.ANY) }
-        var newSpeed by remember { mutableFloatStateOf(1.0f) }
-        var newPitch by remember { mutableFloatStateOf(1.0f) }
-        var newReadByNarrator by remember { mutableStateOf(false) }
-
-        AlertDialog(
-            onDismissRequest = { showAddDialog = false },
-            title = { Text("Add Character") },
-            text = {
-                Column {
-                    OutlinedTextField(
-                        value = newName,
-                        onValueChange = { newName = it },
-                        label = { Text("Character Name") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    Text(text = "Gender Preference:", style = MaterialTheme.typography.labelSmall)
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        listOf(VoiceGender.ANY, VoiceGender.MALE, VoiceGender.FEMALE).forEach { g ->
-                            FilterChip(
-                                selected = newGender == g,
-                                onClick = { newGender = g },
-                                label = { Text(g.name) }
-                            )
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        if (newName.isNotBlank()) {
-                            val id = "char_${newName.lowercase().replace(Regex("[^a-z0-9]"), "_")}_${System.currentTimeMillis()}"
-                            val newChar = Character(
-                                id = id,
-                                name = newName.trim(),
-                                voiceId = newVoiceId,
-                                voiceGender = newGender,
-                                speed = newSpeed,
-                                pitch = newPitch,
-                                readByNarrator = newReadByNarrator
-                            )
-                            scope.launch {
-                                castStore.saveCharacter(STABLE_BOOK_ID, newChar)
-                                if (chapterInputText.isNotBlank()) {
-                                    processAndLoadChapter(chapterInputText)
-                                }
-                            }
-                            controller.updateCharacters(charactersList + newChar)
-                            showAddDialog = false
-                        }
-                    },
-                    enabled = newName.isNotBlank()
-                ) {
-                    Text("Add")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showAddDialog = false }) {
-                    Text("Cancel")
-                }
-            }
-        )
-    }
-}
-

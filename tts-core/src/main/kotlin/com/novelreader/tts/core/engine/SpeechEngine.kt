@@ -1,5 +1,6 @@
 package com.novelreader.tts.core.engine
 
+import com.novelreader.tts.core.catalog.VoiceCatalog
 import com.novelreader.tts.core.model.VoiceInfo
 import com.novelreader.tts.core.model.VoiceSettings
 import kotlinx.coroutines.flow.Flow
@@ -10,7 +11,7 @@ import kotlinx.coroutines.flow.StateFlow
  *
  * Nothing outside the engine implementation may touch platform TextToSpeech.
  */
-interface SpeechEngine {
+interface SpeechEngine : VoiceCatalog {
 
     /**
      * Observable readiness state of the engine.
